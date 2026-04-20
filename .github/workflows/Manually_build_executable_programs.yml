@@ -5,6 +5,8 @@ on:
 
 jobs:
   build:
+    # 在 dev 分支禁用旧版 main.py 打包流程，避免和 WebUI 打包混淆
+    if: ${{ github.ref_name != 'dev' }}
     name: 构建于 ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:

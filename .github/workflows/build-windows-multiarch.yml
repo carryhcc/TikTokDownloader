@@ -3,6 +3,8 @@ name: Build Windows Multi-Arch
 on:
   workflow_dispatch:
   push:
+    branches:
+      - dev
     tags:
       - "v*"
 
@@ -42,4 +44,3 @@ jobs:
         with:
           name: DouKWebUI-${{ matrix.arch }}
           path: DouKWebUI-${{ matrix.arch }}.zip
-
