@@ -1,9 +1,11 @@
 from textwrap import dedent
 from typing import TYPE_CHECKING
+import sys
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import RedirectResponse
 from uvicorn import Config, Server
+from uvicorn.config import LOGGING_CONFIG
 
 from ..custom import (
     __VERSION__,
@@ -97,6 +99,10 @@ class APIServer(TikTok):
             host=host,
             port=port,
             log_level=log_level,
+            # In noconsole packaged apps, stderr can be None; uvicorn's default
+            # formatter accesses isatty() and crashes. Disable default log config
+            # in this mode.
+            log_config=None if getattr(sys, "stderr", None) is None else LOGGING_CONFIG,
         )
         server = Server(config)
         await server.serve()

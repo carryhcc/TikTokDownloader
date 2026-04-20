@@ -41,6 +41,14 @@ class CollectAllRequest(BaseModel):
     fetch_type: str
 
 
+class DbConfigRequest(BaseModel):
+    mysql_host: str
+    mysql_port: int = 3306
+    mysql_user: str = "root"
+    mysql_password: str = ""
+    mysql_database: str = "douk_downloader"
+
+
 class CommentCenterRepository:
     def __init__(self, parameter):
         self.parameter = parameter
@@ -65,6 +73,48 @@ class CommentCenterRepository:
             else:
                 cfg[key] = settings_data.get(key, default)
         return cfg
+
+    def get_mysql_config(self) -> dict[str, Any]:
+        return {
+            "mysql_host": str(self._config.get("mysql_host", "")),
+            "mysql_port": int(self._config.get("mysql_port", 3306)),
+            "mysql_user": str(self._config.get("mysql_user", "root")),
+            "mysql_password": str(self._config.get("mysql_password", "")),
+            "mysql_database": str(self._config.get("mysql_database", "douk_downloader")),
+        }
+
+    def update_mysql_config(self, cfg: dict[str, Any]):
+        self._config.update(
+            {
+                "mysql_host": str(cfg.get("mysql_host", self._config.get("mysql_host", ""))),
+                "mysql_port": int(cfg.get("mysql_port", self._config.get("mysql_port", 3306))),
+                "mysql_user": str(cfg.get("mysql_user", self._config.get("mysql_user", "root"))),
+                "mysql_password": str(cfg.get("mysql_password", self._config.get("mysql_password", ""))),
+                "mysql_database": str(cfg.get("mysql_database", self._config.get("mysql_database", "douk_downloader"))),
+            }
+        )
+
+    def persist_mysql_config(self, cfg: dict[str, Any]):
+        settings = getattr(self.parameter, "settings", None)
+        if not settings or not hasattr(settings, "read") or not hasattr(settings, "update"):
+            return
+        data = settings.read()
+        if not isinstance(data, dict):
+            data = {}
+        data.update(
+            {
+                "mysql_host": cfg["mysql_host"],
+                "mysql_port": int(cfg["mysql_port"]),
+                "mysql_user": cfg["mysql_user"],
+                "mysql_password": cfg["mysql_password"],
+                "mysql_database": cfg["mysql_database"],
+            }
+        )
+        settings.update(data)
+
+    async def test_connection(self):
+        async with self.connection() as _db:
+            return
 
     async def _create_database_if_not_exists(self):
         if connect is None:
@@ -800,6 +850,12 @@ def register_comment_center_routes(app: FastAPI, api_server):
         await controller.repo.ensure_tables()
         initialized = True
 
+    def apply_db_config(cfg: dict[str, Any]):
+        nonlocal initialized
+        controller.repo.update_mysql_config(cfg)
+        controller.repo.persist_mysql_config(cfg)
+        initialized = False
+
     @app.on_event("shutdown")
     async def _shutdown_comment_center_dispatcher():
         await dispatcher.close()
@@ -835,6 +891,27 @@ def register_comment_center_routes(app: FastAPI, api_server):
             raise HTTPException(status_code=400, detail="类型不能为空")
         await controller.repo.add_type(name)
         return {"ok": True}
+
+    @app.get("/comment-center/api/db-config", tags=["评论中心"])
+    async def get_db_config():
+        return controller.repo.get_mysql_config()
+
+    @app.post("/comment-center/api/db-config", tags=["评论中心"])
+    async def set_db_config(item: DbConfigRequest):
+        cfg = item.model_dump()
+        apply_db_config(cfg)
+        return {"ok": True, "message": "数据库配置已更新"}
+
+    @app.post("/comment-center/api/db-config/test", tags=["评论中心"])
+    async def test_db_config(item: DbConfigRequest):
+        cfg = item.model_dump()
+        apply_db_config(cfg)
+        try:
+            await ensure_storage_ready()
+            await controller.repo.test_connection()
+            return {"ok": True, "message": "数据库连接测试成功"}
+        except Exception as e:
+            return {"ok": False, "message": f"数据库连接测试失败: {e}"}
 
     @app.delete("/comment-center/api/types", tags=["评论中心"])
     async def remove_type(name: str = Query(...)):

@@ -28,6 +28,8 @@
     .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
     .scroll { max-height:62vh; overflow:auto; }
     .pager { display:flex; gap:8px; align-items:center; justify-content:flex-end; margin-top:10px; }
+    .db-grid { display:grid; grid-template-columns:2fr 1fr 1fr 1fr 2fr; gap:8px; }
+    @media (max-width: 1000px) { .db-grid { grid-template-columns:1fr 1fr; } }
   </style>
 </head>
 <body>
@@ -36,6 +38,22 @@
     <div class="nav">
       <button class="primary" onclick="location.href='/comment-center/comments'">前往评论列表页</button>
     </div>
+
+    <section class="card">
+      <h3>数据库连接配置</h3>
+      <div class="db-grid">
+        <input id="dbHost" placeholder="MySQL Host/IP" />
+        <input id="dbPort" placeholder="Port" />
+        <input id="dbUser" placeholder="User" />
+        <input id="dbPassword" type="password" placeholder="Password" />
+        <input id="dbName" placeholder="Database Name" />
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button id="btnSaveDb">保存配置</button>
+        <button class="primary" id="btnTestDb">测试并连接</button>
+        <span class="muted" id="dbStatus">未连接数据库</span>
+      </div>
+    </section>
 
     <section class="card">
       <h3>类型管理</h3>
@@ -108,6 +126,7 @@
     let types = [];
     let currentPage = 1;
     const pageSize = 20;
+    let dbReady = false;
 
     async function request(url, options = {}) {
       const resp = await fetch(url, { headers: { "Content-Type": "application/json" }, ...options });
@@ -116,6 +135,59 @@
       return data;
     }
     function esc(s) { return (s ?? "").toString().replace(/[&<>\"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
+
+    function readDbConfigFromForm() {
+      return {
+        mysql_host: q('dbHost').value.trim(),
+        mysql_port: Number(q('dbPort').value || 3306),
+        mysql_user: q('dbUser').value.trim(),
+        mysql_password: q('dbPassword').value,
+        mysql_database: q('dbName').value.trim(),
+      };
+    }
+
+    function fillDbConfigForm(cfg) {
+      q('dbHost').value = cfg.mysql_host || '';
+      q('dbPort').value = cfg.mysql_port || 3306;
+      q('dbUser').value = cfg.mysql_user || 'root';
+      q('dbPassword').value = cfg.mysql_password || '';
+      q('dbName').value = cfg.mysql_database || 'douk_downloader';
+    }
+
+    async function loadDbConfig() {
+      const cfg = await request('/comment-center/api/db-config');
+      fillDbConfigForm(cfg);
+    }
+
+    async function saveDbConfig() {
+      const cfg = readDbConfigFromForm();
+      if (!cfg.mysql_host) return alert('请填写数据库地址');
+      await request('/comment-center/api/db-config', {
+        method: 'POST',
+        body: JSON.stringify(cfg),
+      });
+      q('dbStatus').textContent = '配置已保存，未连接';
+      dbReady = false;
+      alert('数据库配置已保存');
+    }
+
+    async function testDbConfigAndConnect() {
+      const cfg = readDbConfigFromForm();
+      if (!cfg.mysql_host) return alert('请填写数据库地址');
+      const res = await request('/comment-center/api/db-config/test', {
+        method: 'POST',
+        body: JSON.stringify(cfg),
+      });
+      q('dbStatus').textContent = res.message || '';
+      if (!res.ok) {
+        dbReady = false;
+        return alert(res.message || '连接失败');
+      }
+      dbReady = true;
+      await loadTypes();
+      await loadUrls(1);
+      alert('数据库连接成功，数据已加载');
+    }
 
     function renderTypeOptions() {
       const options = ['<option value="">全部类型</option>', ...types.map(t => `<option value="${esc(t)}">${esc(t)}</option>`)].join('');
@@ -129,6 +201,7 @@
     }
 
     async function loadTypes() {
+      if (!dbReady) return;
       const data = await request('/comment-center/api/types');
       types = data.data || [];
       renderTypeOptions();
@@ -143,6 +216,7 @@
     }
 
     async function removeType(encodedName) {
+      if (!dbReady) return alert('请先测试并连接数据库');
       const name = decodeURIComponent(encodedName);
       if (!confirm(`确认删除类型：${name}？`)) return;
       await request(`/comment-center/api/types?name=${encodeURIComponent(name)}`, { method:'DELETE' });
@@ -151,6 +225,7 @@
     }
 
     async function loadUrls(page = currentPage) {
+      if (!dbReady) return;
       const fetchType = q('filterUrlType').value.trim();
       const status = q('filterStatus').value.trim();
       const params = new URLSearchParams({
@@ -183,6 +258,7 @@
     }
 
     async function addUrls() {
+      if (!dbReady) return alert('请先测试并连接数据库');
       const fetch_type = q('urlTypeSelect').value.trim();
       const urls_text = q('newUrls').value.trim();
       if (!fetch_type) return alert('请选择类型');
@@ -197,6 +273,7 @@
     }
 
     async function collectOne(taskId) {
+      if (!dbReady) return alert('请先测试并连接数据库');
       const res = await request('/comment-center/api/collect-one', {
         method:'POST',
         body: JSON.stringify({ task_id: taskId }),
@@ -206,6 +283,7 @@
     }
 
     async function collectAll() {
+      if (!dbReady) return alert('请先测试并连接数据库');
       const fetch_type = q('batchTypeSelect').value.trim();
       if (!fetch_type) return alert('请选择批量采集类型');
       const res = await request('/comment-center/api/collect-all', {
@@ -216,6 +294,8 @@
       alert(`${res.message || '任务后台处理中'}；入队 ${res.queued ?? 0} 条，跳过 ${res.skipped ?? 0} 条`);
     }
 
+    q('btnSaveDb').addEventListener('click', saveDbConfig);
+    q('btnTestDb').addEventListener('click', testDbConfigAndConnect);
     q('btnAddType').addEventListener('click', addType);
     q('btnAddUrl').addEventListener('click', addUrls);
     q('btnFilterUrl').addEventListener('click', () => loadUrls(1));
@@ -225,8 +305,7 @@
 
     (async () => {
       try {
-        await loadTypes();
-        await loadUrls(1);
+        await loadDbConfig();
       } catch (e) {
         alert(e.message);
       }
