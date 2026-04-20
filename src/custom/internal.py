@@ -1,6 +1,13 @@
 from pathlib import Path
+import sys
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.joinpath("Volume")
+# 打包后使用 exe 所在目录作为根目录，避免 onefile 临时目录导致数据丢失
+if getattr(sys, "frozen", False):
+    _base_dir = Path(sys.executable).resolve().parent
+else:
+    _base_dir = Path(__file__).resolve().parent.parent.parent
+
+PROJECT_ROOT = _base_dir.joinpath("Volume")
 PROJECT_ROOT.mkdir(exist_ok=True)
 VERSION_MAJOR = 5
 VERSION_MINOR = 8

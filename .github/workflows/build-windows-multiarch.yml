@@ -1,0 +1,45 @@
+name: Build Windows Multi-Arch
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+            python_arch: x64
+          # ARM64 需要 ARM64 Windows Runner。
+          # 如果你没有 ARM64 自托管 Runner，请把 runner 改成你实际可用标签。
+          - arch: arm64
+            runner: windows-11-arm
+            python_arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.python_arch }}
+
+      - name: Build
+        shell: pwsh
+        run: ./scripts/build_windows.ps1 -ArchTag "${{ matrix.arch }}"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DouKWebUI-${{ matrix.arch }}
+          path: DouKWebUI-${{ matrix.arch }}.zip
+

@@ -34,6 +34,7 @@ from ..models import (
     VideoSearch,
 )
 from ..translation import _
+from .comment_center import register_comment_center_routes
 from .main_terminal import TikTok
 
 if TYPE_CHECKING:
@@ -101,14 +102,16 @@ class APIServer(TikTok):
         await server.serve()
 
     def setup_routes(self):
+        register_comment_center_routes(self.server, self)
+
         @self.server.get(
             "/",
-            summary=_("访问项目 GitHub 仓库"),
-            description=_("重定向至项目 GitHub 仓库主页"),
+            summary=_("访问评论采集中心"),
+            description=_("重定向至评论采集中心页面"),
             tags=[_("项目")],
         )
         async def index():
-            return RedirectResponse(url=REPOSITORY)
+            return RedirectResponse(url="/comment-center/urls")
 
         @self.server.get(
             "/token",

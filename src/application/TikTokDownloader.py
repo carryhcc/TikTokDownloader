@@ -138,8 +138,23 @@ class TikTokDownloader:
         *args,
         **kwargs,
     ):
-        self.console.warning(
-            "该功能正在重构，未来开发完成重新开放！",
+        from threading import Thread
+        from webbrowser import open as open_browser
+
+        self.console.info("正在启动 Web UI 模式...")
+        url = f"http://127.0.0.1:{SERVER_PORT}/comment-center"
+
+        def _open_page():
+            sleep(1.2)
+            open_browser(url)
+
+        Thread(target=_open_page, daemon=True).start()
+        await APIServer(
+            self.parameter,
+            self.database,
+        ).run_server(
+            SERVER_HOST,
+            SERVER_PORT,
         )
 
     async def server(self):

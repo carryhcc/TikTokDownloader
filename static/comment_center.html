@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>评论采集中心</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --card: #ffffff;
+      --line: #dde3ea;
+      --text: #1f2937;
+      --sub: #5b6877;
+      --primary: #0b5fff;
+      --danger: #c53b2d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: linear-gradient(180deg, #eef3ff 0%, var(--bg) 30%, var(--bg) 100%);
+      color: var(--text);
+    }
+    .wrap { max-width: 1280px; margin: 20px auto; padding: 0 16px; }
+    .title { font-size: 24px; font-weight: 700; margin: 0 0 14px; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+    @media (min-width: 1024px) {
+      .grid { grid-template-columns: 1fr 1fr; }
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 8px 18px rgba(0, 26, 88, 0.05);
+    }
+    .card h2 { margin: 0 0 12px; font-size: 18px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    input, select, button {
+      height: 36px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      padding: 0 10px;
+      font-size: 14px;
+    }
+    input, select { min-width: 140px; }
+    input.wide { flex: 1; min-width: 260px; }
+    button { cursor: pointer; }
+    button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+    button.danger { background: #fff4f2; border-color: #ffd4cf; color: var(--danger); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid #edf1f5; text-align: left; padding: 8px 6px; vertical-align: top; }
+    th { color: var(--sub); font-weight: 600; }
+    td.actions { white-space: nowrap; }
+    .muted { color: var(--sub); font-size: 12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .scroll { max-height: 66vh; overflow: auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 class="title">评论采集中心</h1>
+    <div class="grid">
+      <section class="card">
+        <h2>1. URL 列表</h2>
+        <div class="row">
+          <input id="newUrl" class="wide" placeholder="输入作品链接 URL" />
+          <input id="newType" placeholder="获取类型：如 光伏/种植/其他" />
+          <button class="primary" id="btnAddUrl">新增 URL</button>
+        </div>
+        <div class="row">
+          <input id="filterUrlType" placeholder="按获取类型过滤 URL 列表" />
+          <button id="btnFilterUrl">查询</button>
+          <button class="danger" id="btnCollectAll">批量获取所有评论</button>
+        </div>
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>URL / 作品ID</th>
+                <th>获取类型</th>
+                <th>状态</th>
+                <th>更新时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="urlRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>2. 评论列表</h2>
+        <div class="row">
+          <input id="filterCommentType" placeholder="获取类型过滤" />
+          <select id="filterCommentTime">
+            <option value="">评论时间(全部)</option>
+            <option value="1">1天内</option>
+            <option value="3">3天内</option>
+            <option value="7">7天内</option>
+          </select>
+          <input id="filterCommentKeyword" class="wide" placeholder="评论内容模糊查询" />
+          <button id="btnFilterComment">查询</button>
+        </div>
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>作品ID</th>
+                <th>获取类型</th>
+                <th>评论时间</th>
+                <th>昵称</th>
+                <th>评论内容</th>
+              </tr>
+            </thead>
+            <tbody id="commentRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+    <p class="muted">单条“获取评论”对应原逻辑：手动输入待采集的作品链接。批量获取对应原逻辑：从文本文档读取待采集的作品链接（等价批量处理）。</p>
+  </div>
+
+  <script>
+    const q = (id) => document.getElementById(id);
+
+    async function request(url, options = {}) {
+      const resp = await fetch(url, {
+        headers: { "Content-Type": "application/json" },
+        ...options,
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        throw new Error(data.detail || "请求失败");
+      }
+      return data;
+    }
+
+    function esc(s) {
+      return (s ?? "").toString().replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+    }
+
+    async function loadUrls() {
+      const fetchType = q("filterUrlType").value.trim();
+      const data = await request(`/comment-center/api/url-list?fetch_type=${encodeURIComponent(fetchType)}`);
+      q("urlRows").innerHTML = data.data.map(row => `
+        <tr>
+          <td class="mono">${row.id}</td>
+          <td>
+            <div class="mono">${esc(row.url)}</div>
+            <div class="muted">detail_id: ${esc(row.detail_id || "")}</div>
+            ${row.last_error ? `<div style="color:#c53b2d">${esc(row.last_error)}</div>` : ""}
+          </td>
+          <td>${esc(row.fetch_type)}</td>
+          <td>${esc(row.status)}</td>
+          <td class="muted">${esc(row.updated_at || "")}</td>
+          <td class="actions">
+            <button onclick="collectOne(${row.id})">获取评论</button>
+          </td>
+        </tr>
+      `).join("");
+    }
+
+    async function loadComments() {
+      const fetchType = q("filterCommentType").value.trim();
+      const timeRange = q("filterCommentTime").value;
+      const keyword = q("filterCommentKeyword").value.trim();
+      const params = new URLSearchParams({ fetch_type: fetchType, time_range: timeRange, keyword });
+      const data = await request(`/comment-center/api/comments?${params.toString()}`);
+      q("commentRows").innerHTML = data.data.map(row => `
+        <tr>
+          <td class="mono">${row.id}</td>
+          <td class="mono">${esc(row.detail_id)}</td>
+          <td>${esc(row.fetch_type)}</td>
+          <td class="muted">${esc(row.comment_time_text || row.comment_time || "")}</td>
+          <td>${esc(row.nickname || "")}</td>
+          <td>${esc(row.text || "")}</td>
+        </tr>
+      `).join("");
+    }
+
+    async function addUrl() {
+      const url = q("newUrl").value.trim();
+      const fetchType = q("newType").value.trim();
+      if (!url) return alert("请输入 URL");
+      if (!fetchType) return alert("请输入获取类型");
+      await request("/comment-center/api/url-list", {
+        method: "POST",
+        body: JSON.stringify({ url, fetch_type: fetchType }),
+      });
+      q("newUrl").value = "";
+      await loadUrls();
+    }
+
+    async function collectOne(taskId) {
+      const fetchType = prompt("请输入本次获取类型（例如：光伏/种植/其他）");
+      if (!fetchType || !fetchType.trim()) return;
+      await request("/comment-center/api/collect-one", {
+        method: "POST",
+        body: JSON.stringify({ task_id: taskId, fetch_type: fetchType.trim() }),
+      });
+      await Promise.all([loadUrls(), loadComments()]);
+      alert("采集完成");
+    }
+
+    async function collectAll() {
+      const fetchType = prompt("请输入本批次获取类型（例如：光伏/种植/其他）");
+      if (!fetchType || !fetchType.trim()) return;
+      await request("/comment-center/api/collect-all", {
+        method: "POST",
+        body: JSON.stringify({ fetch_type: fetchType.trim() }),
+      });
+      await Promise.all([loadUrls(), loadComments()]);
+      alert("批量采集完成");
+    }
+
+    q("btnAddUrl").addEventListener("click", addUrl);
+    q("btnFilterUrl").addEventListener("click", loadUrls);
+    q("btnFilterComment").addEventListener("click", loadComments);
+    q("btnCollectAll").addEventListener("click", collectAll);
+
+    Promise.all([loadUrls(), loadComments()]).catch(err => alert(err.message));
+  </script>
+</body>
+</html>

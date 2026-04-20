@@ -2,6 +2,8 @@ from shutil import move
 from typing import TYPE_CHECKING
 
 from .csv import CSVLogger
+from .mysql import MySQLLogger
+from .mysql_config import resolve_mysql_logger_params
 from .sqlite import SQLLogger
 from .text import BaseTextLogger
 from .xlsx import XLSXLogger
@@ -612,7 +614,7 @@ class RecordManager:
         "csv": CSVLogger,
         "xlsx": XLSXLogger,
         "sql": SQLLogger,
-        # "mysql": BaseTextLogger,
+        "mysql": MySQLLogger,
     }
 
     def run(
@@ -631,12 +633,19 @@ class RecordManager:
             name,
         )
         root.mkdir(exist_ok=True)
-        params = self.LoggerParams[type_]
+        params = self.LoggerParams[type_].copy()
         logger = (
             BaseTextLogger
             if blank
             else self.DataLogger.get(parameter.storage_format, BaseTextLogger)
         )
+        if logger is MySQLLogger:
+            params.update(
+                resolve_mysql_logger_params(
+                    parameter,
+                    type_,
+                )
+            )
         return root, params, logger
 
     @staticmethod

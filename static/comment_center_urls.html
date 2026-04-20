@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>评论采集中心 - URL 列表</title>
+  <style>
+    :root { --bg:#f6f8fb; --card:#fff; --line:#dde3ea; --text:#1f2937; --sub:#5b6877; --primary:#0b5fff; --danger:#c53b2d; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:"PingFang SC","Microsoft YaHei",sans-serif; background:linear-gradient(180deg,#eef3ff 0%,var(--bg) 30%,var(--bg) 100%); color:var(--text); }
+    .wrap { max-width:1200px; margin:20px auto; padding:0 16px; }
+    .title { font-size:24px; font-weight:700; margin:0 0 12px; }
+    .nav { margin-bottom:12px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; box-shadow:0 8px 18px rgba(0,26,88,.05); margin-bottom:12px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+    input, select, textarea, button { border-radius:8px; border:1px solid var(--line); background:#fff; color:var(--text); padding:8px 10px; font-size:14px; }
+    input, select, button { height:36px; }
+    textarea { width:100%; min-height:120px; resize:vertical; }
+    button { cursor:pointer; }
+    button.primary { background:var(--primary); border-color:var(--primary); color:#fff; }
+    button.danger { background:#fff4f2; border-color:#ffd4cf; color:var(--danger); }
+    .type-item { display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border:1px solid #e5eaf2; border-radius:999px; margin-right:6px; margin-bottom:6px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { border-bottom:1px solid #edf1f5; text-align:left; padding:8px 6px; vertical-align:top; }
+    th { color:var(--sub); font-weight:600; }
+    td.actions { white-space:nowrap; }
+    .muted { color:var(--sub); font-size:12px; }
+    .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    .scroll { max-height:62vh; overflow:auto; }
+    .pager { display:flex; gap:8px; align-items:center; justify-content:flex-end; margin-top:10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 class="title">评论采集中心 - URL 列表</h1>
+    <div class="nav">
+      <button class="primary" onclick="location.href='/comment-center/comments'">前往评论列表页</button>
+    </div>
+
+    <section class="card">
+      <h3>类型管理</h3>
+      <div class="row">
+        <input id="newTypeName" placeholder="新增类型：如 光伏" />
+        <button class="primary" id="btnAddType">新增类型</button>
+      </div>
+      <div id="typesBox"></div>
+    </section>
+
+    <section class="card">
+      <h3>批量添加 URL（一行一个）</h3>
+      <div class="row">
+        <select id="urlTypeSelect"></select>
+      </div>
+      <textarea id="newUrls" placeholder="每行一个 URL"></textarea>
+      <div class="row" style="margin-top:10px;">
+        <button class="primary" id="btnAddUrl">批量新增 URL</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>URL 查询</h3>
+      <div class="row">
+        <select id="filterUrlType"></select>
+        <select id="filterStatus">
+          <option value="">全部状态</option>
+          <option value="未处理">未处理</option>
+          <option value="等待中">等待中</option>
+          <option value="处理中">处理中</option>
+          <option value="处理完成">处理完成</option>
+          <option value="处理失败">处理失败</option>
+        </select>
+        <button id="btnFilterUrl">查询</button>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>URL / 作品ID</th>
+              <th>类型</th>
+              <th>状态</th>
+              <th>更新时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="urlRows"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <span class="muted" id="urlPagerInfo"></span>
+        <button id="btnPrevPage">上一页</button>
+        <button id="btnNextPage">下一页</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>批量获取评论</h3>
+      <div class="row">
+        <select id="batchTypeSelect"></select>
+        <button class="danger" id="btnCollectAll">批量获取当前类型评论</button>
+      </div>
+      <div class="muted">说明：该操作会将所选类型下的任务批量加入后台队列。</div>
+    </section>
+  </div>
+
+  <script>
+    const q = (id) => document.getElementById(id);
+    let types = [];
+    let currentPage = 1;
+    const pageSize = 20;
+
+    async function request(url, options = {}) {
+      const resp = await fetch(url, { headers: { "Content-Type": "application/json" }, ...options });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.detail || "请求失败");
+      return data;
+    }
+    function esc(s) { return (s ?? "").toString().replace(/[&<>\"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
+
+    function renderTypeOptions() {
+      const options = ['<option value="">全部类型</option>', ...types.map(t => `<option value="${esc(t)}">${esc(t)}</option>`)].join('');
+      q('filterUrlType').innerHTML = options;
+
+      const required = ['<option value="">请选择类型</option>', ...types.map(t => `<option value="${esc(t)}">${esc(t)}</option>`)].join('');
+      q('urlTypeSelect').innerHTML = required;
+      q('batchTypeSelect').innerHTML = required;
+
+      q('typesBox').innerHTML = types.map(t => `<span class="type-item">${esc(t)} <button onclick="removeType('${encodeURIComponent(t)}')">删除</button></span>`).join('');
+    }
+
+    async function loadTypes() {
+      const data = await request('/comment-center/api/types');
+      types = data.data || [];
+      renderTypeOptions();
+    }
+
+    async function addType() {
+      const name = q('newTypeName').value.trim();
+      if (!name) return alert('请输入类型名称');
+      await request('/comment-center/api/types', { method:'POST', body: JSON.stringify({ name }) });
+      q('newTypeName').value = '';
+      await loadTypes();
+    }
+
+    async function removeType(encodedName) {
+      const name = decodeURIComponent(encodedName);
+      if (!confirm(`确认删除类型：${name}？`)) return;
+      await request(`/comment-center/api/types?name=${encodeURIComponent(name)}`, { method:'DELETE' });
+      await loadTypes();
+      await loadUrls(1);
+    }
+
+    async function loadUrls(page = currentPage) {
+      const fetchType = q('filterUrlType').value.trim();
+      const status = q('filterStatus').value.trim();
+      const params = new URLSearchParams({
+        fetch_type: fetchType,
+        status,
+        page: String(page),
+        page_size: String(pageSize),
+      });
+      const data = await request(`/comment-center/api/url-list?${params.toString()}`);
+      currentPage = data.page || page;
+      q('urlRows').innerHTML = (data.items || []).map(row => `
+        <tr>
+          <td class="mono">${row.id}</td>
+          <td>
+            <div class="mono">${esc(row.url)}</div>
+            <div class="muted">detail_id: ${esc(row.detail_id || '')}</div>
+            ${row.last_error ? `<div style="color:#c53b2d">${esc(row.last_error)}</div>` : ''}
+          </td>
+          <td>${esc(row.fetch_type)}</td>
+          <td>${esc(row.status)}</td>
+          <td class="muted">${esc(row.updated_at || '')}</td>
+          <td class="actions"><button onclick="collectOne(${row.id})">获取评论</button></td>
+        </tr>
+      `).join('');
+      const total = data.total || 0;
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      q('urlPagerInfo').textContent = `第 ${currentPage} / ${totalPages} 页，共 ${total} 条`;
+      q('btnPrevPage').disabled = currentPage <= 1;
+      q('btnNextPage').disabled = currentPage >= totalPages;
+    }
+
+    async function addUrls() {
+      const fetch_type = q('urlTypeSelect').value.trim();
+      const urls_text = q('newUrls').value.trim();
+      if (!fetch_type) return alert('请选择类型');
+      if (!urls_text) return alert('请输入 URL（每行一个）');
+      const res = await request('/comment-center/api/url-list', {
+        method:'POST',
+        body: JSON.stringify({ fetch_type, urls_text }),
+      });
+      q('newUrls').value = '';
+      await loadUrls(1);
+      alert(`新增完成，新增 ${res.inserted} 条，重复 ${res.duplicated} 条`);
+    }
+
+    async function collectOne(taskId) {
+      const res = await request('/comment-center/api/collect-one', {
+        method:'POST',
+        body: JSON.stringify({ task_id: taskId }),
+      });
+      await loadUrls(currentPage);
+      alert(res.message || '任务后台处理中');
+    }
+
+    async function collectAll() {
+      const fetch_type = q('batchTypeSelect').value.trim();
+      if (!fetch_type) return alert('请选择批量采集类型');
+      const res = await request('/comment-center/api/collect-all', {
+        method:'POST',
+        body: JSON.stringify({ fetch_type }),
+      });
+      await loadUrls(currentPage);
+      alert(`${res.message || '任务后台处理中'}；入队 ${res.queued ?? 0} 条，跳过 ${res.skipped ?? 0} 条`);
+    }
+
+    q('btnAddType').addEventListener('click', addType);
+    q('btnAddUrl').addEventListener('click', addUrls);
+    q('btnFilterUrl').addEventListener('click', () => loadUrls(1));
+    q('btnCollectAll').addEventListener('click', collectAll);
+    q('btnPrevPage').addEventListener('click', () => loadUrls(currentPage - 1));
+    q('btnNextPage').addEventListener('click', () => loadUrls(currentPage + 1));
+
+    (async () => {
+      try {
+        await loadTypes();
+        await loadUrls(1);
+      } catch (e) {
+        alert(e.message);
+      }
+    })();
+
+    window.removeType = removeType;
+    window.collectOne = collectOne;
+  </script>
+</body>
+</html>
