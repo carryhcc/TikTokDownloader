@@ -132,6 +132,51 @@
     .region-grid { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 6px 10px; }
     .region-item { display: flex; gap: 6px; align-items: center; font-size: 13px; color: #374151; }
     .link-btn { background: #fff; border: 1px solid var(--line); color: #526173; height: 32px; }
+    .modal {
+      position: fixed;
+      inset: 0;
+      z-index: 10000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15, 23, 42, 0.45);
+      padding: 16px;
+    }
+    .modal.show { display: flex; }
+    .modal-card {
+      width: min(760px, 100%);
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 20px 40px rgba(15, 23, 42, 0.2);
+    }
+    .modal-title { margin: 0 0 6px; font-size: 20px; }
+    .modal-desc { margin: 0 0 12px; color: var(--sub); font-size: 13px; }
+    .mode-list { display: grid; gap: 8px; margin-bottom: 12px; }
+    .mode-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      border: 1px solid #e5eaf2;
+      border-radius: 10px;
+      padding: 10px;
+      background: #fafcff;
+    }
+    .mode-item.active {
+      border-color: #b6cdfd;
+      background: #eef4ff;
+    }
+    .mode-main { font-weight: 600; color: #1f2937; margin-bottom: 2px; }
+    .mode-sub { font-size: 12px; color: var(--sub); }
+    .custom-url-box { display: none; margin-top: 8px; }
+    .custom-url-box.show { display: block; }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 12px;
+    }
 
     @media (max-width: 1000px) {
       .db-grid { grid-template-columns: 1fr 1fr; }
@@ -188,6 +233,7 @@
             <option value="处理失败">处理失败</option>
           </select>
           <button id="btnFilterUrl">查询</button>
+          <button id="btnResetDailyStatus">重置为今日未处理</button>
         </div>
         <div class="scroll">
           <table>
@@ -217,7 +263,7 @@
           <select id="batchTypeSelect"></select>
           <button class="danger" id="btnCollectAll">批量获取当前类型评论</button>
         </div>
-        <div class="muted">说明：该操作会将所选类型下的任务批量加入后台队列。</div>
+        <div class="muted">说明：点击后可选择跑全部（跳过今日已完成）、仅未处理或自定义 URL 列表。</div>
       </div>
     </section>
 
@@ -251,6 +297,11 @@
             <option value="1">1天内</option>
             <option value="3">3天内</option>
             <option value="7">7天内</option>
+          </select>
+          <select id="filterHasPhone">
+            <option value="no" selected>有手机号：否</option>
+            <option value="yes">有手机号：是</option>
+            <option value="all">有手机号：全部</option>
           </select>
           <input id="filterCommentKeyword" class="wide" placeholder="评论内容模糊查询" />
         </div>
@@ -362,6 +413,43 @@
     </section>
   </div>
 
+  <div class="modal" id="batchModeModal">
+    <div class="modal-card">
+      <h3 class="modal-title">选择批量采集模式</h3>
+      <p class="modal-desc" id="batchModeDesc"></p>
+      <div class="mode-list">
+        <label class="mode-item" id="modeItemAll">
+          <input type="radio" name="batch_mode" value="all" checked />
+          <div>
+            <div class="mode-main" id="batchModeAllMain">跑所有数据</div>
+            <div class="mode-sub">会跳过今日已处理完成的 URL</div>
+          </div>
+        </label>
+        <label class="mode-item" id="modeItemUnprocessed">
+          <input type="radio" name="batch_mode" value="unprocessed" />
+          <div>
+            <div class="mode-main" id="batchModeUnprocessedMain">跑未处理数据</div>
+            <div class="mode-sub">仅执行当前状态为“未处理”的 URL</div>
+          </div>
+        </label>
+        <label class="mode-item" id="modeItemCustom">
+          <input type="radio" name="batch_mode" value="custom" />
+          <div>
+            <div class="mode-main">跑自定义 URL 列表</div>
+            <div class="mode-sub">支持多行、逗号或分号分隔</div>
+          </div>
+        </label>
+      </div>
+      <div class="custom-url-box" id="batchCustomUrlBox">
+        <textarea id="batchCustomUrls" placeholder="请输入 URL 列表"></textarea>
+      </div>
+      <div class="modal-actions">
+        <button id="btnBatchModeCancel">取消</button>
+        <button class="primary" id="btnBatchModeConfirm">开始执行</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const q = (id) => document.getElementById(id);
     const TAB_KEYS = ["urls", "comments", "task-manager", "import", "settings", "logs"];
@@ -378,6 +466,7 @@
     let startupConnecting = false;
     let collectAllSubmitting = false;
     let taskManagerTimer = null;
+    let batchModeResolver = null;
 
     async function request(url, options = {}) {
       const resp = await fetch(url, { headers: { "Content-Type": "application/json" }, ...options });
@@ -517,12 +606,14 @@
       const fetchType = q("filterCommentType").value.trim();
       const detailId = q("filterDetailId").value.trim();
       const timeRange = q("filterCommentTime").value;
+      const hasPhone = q("filterHasPhone").value.trim() || "no";
       const keyword = q("filterCommentKeyword").value.trim();
       const regions = selectedRegions().join(",");
       return new URLSearchParams({
         detail_id: detailId,
         fetch_type: fetchType,
         time_range: timeRange,
+        has_phone: hasPhone,
         keyword,
         regions,
         page: String(page),
@@ -711,9 +802,33 @@
       collectAllSubmitting = true;
       q("btnCollectAll").disabled = true;
       try {
+        const options = await request(`/comment-center/api/collect-all/options?fetch_type=${encodeURIComponent(fetch_type)}`);
+        if (options.conflict && options.active_batch) {
+          const runningType = options.active_batch.fetch_type || "未知类型";
+          const yes = confirm(`已有任务进行中（类型：${runningType}），是否结束当前批量任务？`);
+          if (!yes) return;
+          const stopRes = await request("/comment-center/api/collect-all/stop", {
+            method: "POST",
+            body: JSON.stringify({ batch_id: options.active_batch.batch_id }),
+          });
+          await Promise.all([loadUrls(1), loadTaskManager()]);
+          alert(stopRes.message || "当前批量任务已终止");
+          return;
+        }
+
+        if (!options.ok) {
+          alert(options.message || "操作失败");
+          return;
+        }
+
+        const picked = await openBatchModeDialog(options, fetch_type);
+        if (!picked) return;
+        const mode = picked.mode;
+        const urls_text = picked.urls_text || "";
+
         const res = await request("/comment-center/api/collect-all", {
           method: "POST",
-          body: JSON.stringify({ fetch_type }),
+          body: JSON.stringify({ fetch_type, mode, urls_text }),
         });
         if (res.ok) {
           await Promise.all([loadUrls(currentUrlPage), loadTaskManager()]);
@@ -737,6 +852,53 @@
         collectAllSubmitting = false;
         q("btnCollectAll").disabled = false;
       }
+    }
+
+    function setBatchModeActive(mode) {
+      ["all", "unprocessed", "custom"].forEach((key) => {
+        const item = q(`modeItem${key.charAt(0).toUpperCase() + key.slice(1)}`);
+        if (item) item.classList.toggle("active", key === mode);
+      });
+      q("batchCustomUrlBox").classList.toggle("show", mode === "custom");
+    }
+
+    function closeBatchModeDialog(result) {
+      q("batchModeModal").classList.remove("show");
+      if (batchModeResolver) {
+        const resolve = batchModeResolver;
+        batchModeResolver = null;
+        resolve(result);
+      }
+    }
+
+    function openBatchModeDialog(options, fetchType) {
+      const total = Number(options.total_count || 0);
+      const unprocessed = Number(options.unprocessed_count || 0);
+      q("batchModeDesc").textContent = `类型：${fetchType}，总数 ${total}，未处理 ${unprocessed}`;
+      q("batchModeAllMain").textContent = `跑所有数据（当前类型 ${total} 条）`;
+      q("batchModeUnprocessedMain").textContent = `跑未处理数据（总数 ${total} / 未处理 ${unprocessed}）`;
+      q("batchCustomUrls").value = "";
+      const radios = Array.from(document.querySelectorAll('input[name="batch_mode"]'));
+      radios.forEach((r) => { r.checked = r.value === "all"; });
+      setBatchModeActive("all");
+      q("batchModeModal").classList.add("show");
+      return new Promise((resolve) => {
+        batchModeResolver = resolve;
+      });
+    }
+
+    async function resetDailyStatus() {
+      if (!dbReady) return alertNeedDb();
+      const fetchType = q("filterUrlType").value.trim();
+      const scopeText = fetchType ? `类型「${fetchType}」` : "全部类型";
+      const yes = confirm(`确认将${scopeText}中处理时间为空或早于今日 00:00 的记录重置为“未处理”？`);
+      if (!yes) return;
+      const res = await request("/comment-center/api/url-list/reset-daily", {
+        method: "POST",
+        body: JSON.stringify({ fetch_type: fetchType }),
+      });
+      await Promise.all([loadUrls(1), loadTaskManager()]);
+      alert(`${res.message || "状态重置完成"}；重置 ${res.affected ?? 0} 条`);
     }
 
     async function loadTaskManager() {
@@ -805,6 +967,7 @@
     q("btnAddUrl").addEventListener("click", addUrls);
 
     q("btnFilterUrl").addEventListener("click", () => loadUrls(1));
+    q("btnResetDailyStatus").addEventListener("click", resetDailyStatus);
     q("btnCollectAll").addEventListener("click", collectAll);
     q("btnPrevPage").addEventListener("click", () => loadUrls(currentUrlPage - 1));
     q("btnNextPage").addEventListener("click", () => loadUrls(currentUrlPage + 1));
@@ -820,6 +983,20 @@
     q("btnClearRegions").addEventListener("click", () => {
       document.querySelectorAll('input[name="region_filter"]').forEach(el => { el.checked = false; });
       renderSelectedRegionTags();
+    });
+    document.querySelectorAll('input[name="batch_mode"]').forEach(el => {
+      el.addEventListener("change", () => setBatchModeActive(el.value));
+    });
+    q("btnBatchModeCancel").addEventListener("click", () => closeBatchModeDialog(null));
+    q("btnBatchModeConfirm").addEventListener("click", () => {
+      const picked = document.querySelector('input[name="batch_mode"]:checked');
+      const mode = (picked?.value || "all").trim();
+      const urlsText = q("batchCustomUrls").value.trim();
+      if (mode === "custom" && !urlsText) {
+        alert("请输入至少一个 URL");
+        return;
+      }
+      closeBatchModeDialog({ mode, urls_text: urlsText });
     });
 
     document.querySelectorAll(".tab-btn").forEach(btn => {

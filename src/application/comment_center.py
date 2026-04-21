@@ -10,6 +10,7 @@ from random import shuffle
 from re import search
 from urllib.parse import parse_qs, urlparse
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -43,10 +44,16 @@ class CollectOneRequest(BaseModel):
 
 class CollectAllRequest(BaseModel):
     fetch_type: str
+    mode: str = "all"
+    urls_text: str = ""
 
 
 class StopBatchRequest(BaseModel):
     batch_id: int
+
+
+class ResetDailyStatusRequest(BaseModel):
+    fetch_type: str = ""
 
 
 class DbConfigRequest(BaseModel):
@@ -60,6 +67,14 @@ class DbConfigRequest(BaseModel):
 class DouyinTokenSwitchRequest(BaseModel):
     method: str
     browser: str = ""
+
+
+BIZ_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _today_start_text() -> str:
+    now = datetime.now(BIZ_TZ)
+    return f"{now.year:04d}-{now.month:02d}-{now.day:02d} 00:00:00"
 
 
 class CommentCenterRepository:
@@ -530,6 +545,75 @@ class CommentCenterRepository:
                 rows = await cursor.fetchall()
         return [int(r[0]) for r in rows]
 
+    async def reset_stale_statuses_to_pending(
+        self,
+        day_start: str,
+        fetch_type: str = "",
+    ) -> int:
+        sql = (
+            "UPDATE `comment_url_tasks` "
+            "SET status='未处理' "
+            "WHERE (last_fetch_at IS NULL OR last_fetch_at < %s) "
+            "AND status NOT IN ('未处理', '等待中', '处理中')"
+        )
+        params: list[Any] = [day_start]
+        if fetch_type:
+            sql += " AND fetch_type=%s"
+            params.append(fetch_type)
+        async with self.connection() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute(sql, tuple(params))
+                return int(cursor.rowcount or 0)
+
+    async def get_fetch_type_counts(self, fetch_type: str) -> dict[str, int]:
+        async with self.connection() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_count,
+                        SUM(CASE WHEN status='未处理' THEN 1 ELSE 0 END) AS unprocessed_count
+                    FROM `comment_url_tasks`
+                    WHERE fetch_type=%s
+                    """,
+                    (fetch_type,),
+                )
+                row = await cursor.fetchone()
+        return {
+            "total_count": int(row[0] or 0) if row else 0,
+            "unprocessed_count": int(row[1] or 0) if row else 0,
+        }
+
+    async def list_url_tasks_for_batch(
+        self,
+        fetch_type: str,
+        urls: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = [fetch_type]
+        sql = (
+            "SELECT id, url, status "
+            "FROM `comment_url_tasks` "
+            "WHERE fetch_type=%s"
+        )
+        if urls:
+            placeholders = ", ".join(["%s"] * len(urls))
+            sql += f" AND url IN ({placeholders})"
+            params.extend(urls)
+        sql += " ORDER BY id DESC"
+
+        async with self.connection() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute(sql, tuple(params))
+                rows = await cursor.fetchall()
+        return [
+            {
+                "id": int(r[0]),
+                "url": str(r[1] or ""),
+                "status": str(r[2] or ""),
+            }
+            for r in rows
+        ]
+
     async def batch_update_task_status(self, task_ids: list[int], status: str, error: str | None = None):
         ids = [int(i) for i in task_ids if int(i) > 0]
         if not ids:
@@ -629,8 +713,8 @@ class CommentCenterRepository:
                         """
                         INSERT INTO `comment_records` (
                             task_id, url, detail_id, fetch_type, dedupe_key, cid, comment_time, comment_time_text,
-                            nickname, uid, sec_uid, ip_label, text, digg_count, reply_comment_total, raw_json
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            nickname, uid, sec_uid, ip_label, text, digg_count, reply_comment_total
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         AS new
                         ON DUPLICATE KEY UPDATE
                             task_id=new.task_id,
@@ -645,8 +729,7 @@ class CommentCenterRepository:
                             ip_label=new.ip_label,
                             text=new.text,
                             digg_count=new.digg_count,
-                            reply_comment_total=new.reply_comment_total,
-                            raw_json=new.raw_json
+                            reply_comment_total=new.reply_comment_total
                         """,
                         (
                             task_id,
@@ -664,7 +747,6 @@ class CommentCenterRepository:
                             text,
                             int(item.get("digg_count") or 0),
                             int(item.get("reply_comment_total") or 0),
-                            str(item),
                         ),
                     )
 
@@ -710,6 +792,7 @@ class CommentCenterRepository:
         days: int | None = None,
         keyword: str = "",
         regions: list[str] | None = None,
+        has_phone: str = "no",
         page: int = 1,
         page_size: int = 20,
     ) -> dict[str, Any]:
@@ -722,6 +805,7 @@ class CommentCenterRepository:
             days=days,
             keyword=keyword,
             regions=regions or [],
+            has_phone=has_phone,
         )
         sql = (
             "SELECT id, detail_id, uid, nickname, ip_label, comment_time, comment_time_text, text "
@@ -766,6 +850,7 @@ class CommentCenterRepository:
         days: int | None = None,
         keyword: str = "",
         regions: list[str] | None = None,
+        has_phone: str = "no",
     ) -> list[dict[str, Any]]:
         where_sql, params = self._build_comment_filters(
             detail_id=detail_id,
@@ -773,6 +858,7 @@ class CommentCenterRepository:
             days=days,
             keyword=keyword,
             regions=regions or [],
+            has_phone=has_phone,
         )
         sql = (
             "SELECT uid, nickname, ip_label, comment_time, comment_time_text, text "
@@ -812,6 +898,7 @@ class CommentCenterRepository:
         days: int | None,
         keyword: str,
         regions: list[str],
+        has_phone: str = "no",
     ) -> tuple[str, list[Any]]:
         where: list[str] = []
         params: list[Any] = []
@@ -835,6 +922,22 @@ class CommentCenterRepository:
                 region_sql.append("ip_label LIKE %s")
                 params.append(f"{region}%")
             where.append("(" + " OR ".join(region_sql) + ")")
+        if has_phone == "yes":
+            where.append(
+                "EXISTS ("
+                "SELECT 1 FROM `uid_p` u "
+                "WHERE u.uid = comment_records.uid "
+                "AND u.phone IS NOT NULL AND u.phone <> ''"
+                ")"
+            )
+        elif has_phone == "no":
+            where.append(
+                "NOT EXISTS ("
+                "SELECT 1 FROM `uid_p` u "
+                "WHERE u.uid = comment_records.uid "
+                "AND u.phone IS NOT NULL AND u.phone <> ''"
+                ")"
+            )
         return (" AND " + " AND ".join(where)) if where else "", params
 
 
@@ -1193,6 +1296,27 @@ def _split_urls(req: UrlCreateRequest) -> tuple[list[str], list[str]]:
     return result, invalid
 
 
+def _split_input_urls(urls_text: str) -> tuple[list[str], list[str]]:
+    urls: list[str] = []
+    for raw in (urls_text or "").replace(",", "\n").replace(";", "\n").splitlines():
+        s = raw.strip()
+        if s:
+            urls.append(s)
+
+    seen = set()
+    result = []
+    invalid = []
+    for u in urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        if _is_valid_http_url(u):
+            result.append(u)
+        else:
+            invalid.append(u)
+    return result, invalid
+
+
 def register_comment_center_routes(app: FastAPI, api_server):
     controller = CommentCenterController(api_server)
     dispatcher = CommentTaskDispatcher(controller)
@@ -1311,12 +1435,36 @@ def register_comment_center_routes(app: FastAPI, api_server):
         page_size: int = Query(default=20),
     ):
         await ensure_storage_ready()
+        await controller.repo.reset_stale_statuses_to_pending(
+            day_start=_today_start_text(),
+            fetch_type=fetch_type.strip(),
+        )
         return await controller.repo.list_url_tasks(
             fetch_type=fetch_type.strip(),
             status=status.strip(),
             page=page,
             page_size=page_size,
         )
+
+    @app.post("/comment-center/api/url-list/reset-daily", tags=["评论中心"])
+    async def reset_url_status_daily(req: ResetDailyStatusRequest):
+        await ensure_storage_ready()
+        fetch_type = req.fetch_type.strip()
+        day_start = _today_start_text()
+        affected = await controller.repo.reset_stale_statuses_to_pending(
+            day_start=day_start,
+            fetch_type=fetch_type,
+        )
+        controller.log_info(
+            f"手动重置状态完成，类型：{fetch_type or '全部'}，重置数量：{affected}，分界时间：{day_start}"
+        )
+        return {
+            "ok": True,
+            "affected": affected,
+            "fetch_type": fetch_type,
+            "day_start": day_start,
+            "message": "状态重置完成",
+        }
 
     @app.post("/comment-center/api/url-list", tags=["评论中心"])
     async def create_url(item: UrlCreateRequest):
@@ -1363,12 +1511,41 @@ def register_comment_center_routes(app: FastAPI, api_server):
         controller.log_info(f"单条任务 #{req.task_id} 已提交后台队列，queued={queued}")
         return {"ok": True, "queued": queued, "message": "任务后台处理中"}
 
+    @app.get("/comment-center/api/collect-all/options", tags=["评论中心"])
+    async def collect_all_options(fetch_type: str = Query(default="")):
+        await ensure_storage_ready()
+        fetch_type = fetch_type.strip()
+        if not fetch_type:
+            raise HTTPException(status_code=400, detail="获取类型不能为空")
+        active_batch = await dispatcher.get_active_batch()
+        if active_batch:
+            return {
+                "ok": False,
+                "conflict": True,
+                "active_batch": active_batch,
+                "message": "已有批量任务进行中",
+            }
+        await controller.repo.reset_stale_statuses_to_pending(
+            day_start=_today_start_text(),
+            fetch_type=fetch_type,
+        )
+        counts = await controller.repo.get_fetch_type_counts(fetch_type)
+        return {
+            "ok": True,
+            "fetch_type": fetch_type,
+            "total_count": counts["total_count"],
+            "unprocessed_count": counts["unprocessed_count"],
+        }
+
     @app.post("/comment-center/api/collect-all", tags=["评论中心"])
     async def collect_all(req: CollectAllRequest):
         await ensure_storage_ready()
         fetch_type = req.fetch_type.strip()
+        mode = req.mode.strip().lower() or "all"
         if not fetch_type:
             raise HTTPException(status_code=400, detail="获取类型不能为空")
+        if mode not in {"all", "unprocessed", "custom"}:
+            raise HTTPException(status_code=400, detail="mode 仅支持 all / unprocessed / custom")
         active_batch = await dispatcher.get_active_batch()
         if active_batch:
             controller.log_warning(
@@ -1381,10 +1558,62 @@ def register_comment_center_routes(app: FastAPI, api_server):
                 "message": "已有批量任务进行中",
             }
 
-        task_ids = await controller.repo.list_url_task_ids_by_type(fetch_type)
+        await controller.repo.reset_stale_statuses_to_pending(
+            day_start=_today_start_text(),
+            fetch_type=fetch_type,
+        )
+
+        skipped_before_queue = 0
+        missing_count = 0
+        task_ids: list[int] = []
+        mode_text = {
+            "all": "全部（跳过今日已完成）",
+            "unprocessed": "仅未处理",
+            "custom": "自定义URL",
+        }.get(mode, mode)
+
+        if mode == "custom":
+            urls, invalid_urls = _split_input_urls(req.urls_text)
+            if not urls:
+                raise HTTPException(status_code=400, detail="自定义模式没有有效 URL，请输入 http/https URL")
+            tasks = await controller.repo.list_url_tasks_for_batch(fetch_type, urls=urls)
+            task_by_url = {str(t["url"]): t for t in tasks}
+            for url in urls:
+                task = task_by_url.get(url)
+                if not task:
+                    missing_count += 1
+                    continue
+                if task["status"] in {"等待中", "处理中"}:
+                    skipped_before_queue += 1
+                    continue
+                task_ids.append(int(task["id"]))
+            missing_count += len(invalid_urls)
+        else:
+            tasks = await controller.repo.list_url_tasks_for_batch(fetch_type)
+            for task in tasks:
+                status = str(task["status"] or "")
+                if status in {"等待中", "处理中"}:
+                    skipped_before_queue += 1
+                    continue
+                if mode == "all":
+                    if status == "处理完成":
+                        skipped_before_queue += 1
+                        continue
+                    task_ids.append(int(task["id"]))
+                elif mode == "unprocessed":
+                    if status == "未处理":
+                        task_ids.append(int(task["id"]))
+                    else:
+                        skipped_before_queue += 1
+
         if not task_ids:
-            controller.log_warning(f"批量任务未启动，类型 {fetch_type} 没有 URL 任务")
-            return {"ok": False, "queued": 0, "skipped": 0, "message": "当前类型没有 URL 任务"}
+            controller.log_warning(f"批量任务未启动，类型 {fetch_type} 没有可执行 URL 任务，模式：{mode_text}")
+            return {
+                "ok": False,
+                "queued": 0,
+                "skipped": skipped_before_queue + missing_count,
+                "message": "没有可执行的 URL 任务",
+            }
 
         shuffle(task_ids)
         batch, err = await dispatcher.create_batch(fetch_type, len(task_ids))
@@ -1396,15 +1625,16 @@ def register_comment_center_routes(app: FastAPI, api_server):
         for task_id in task_ids:
             if await dispatcher.enqueue(task_id, batch_id=int(batch["batch_id"])):
                 queued += 1
-        skipped = max(0, len(task_ids) - queued)
+        skipped = skipped_before_queue + missing_count + max(0, len(task_ids) - queued)
         controller.log_info(
-            f"批量任务 #{batch['batch_id']} 已提交队列，类型：{fetch_type}，入队：{queued}，跳过：{skipped}，顺序：随机"
+            f"批量任务 #{batch['batch_id']} 已提交队列，类型：{fetch_type}，模式：{mode_text}，入队：{queued}，跳过：{skipped}，顺序：随机"
         )
         return {
             "ok": True,
             "queued": queued,
             "skipped": skipped,
             "batch": batch,
+            "mode": mode,
             "message": "批量任务已启动",
         }
 
@@ -1418,6 +1648,7 @@ def register_comment_center_routes(app: FastAPI, api_server):
     @app.get("/comment-center/api/task-manager", tags=["评论中心"])
     async def task_manager():
         await ensure_storage_ready()
+        await controller.repo.reset_stale_statuses_to_pending(day_start=_today_start_text())
         type_stats = await controller.repo.list_task_type_stats()
         comment_counts = await controller.repo.list_comment_type_counts()
         active_batch = await dispatcher.get_active_batch()
@@ -1450,6 +1681,7 @@ def register_comment_center_routes(app: FastAPI, api_server):
         time_range: str = Query(default=""),
         keyword: str = Query(default=""),
         regions: str = Query(default=""),
+        has_phone: str = Query(default="no"),
         page: int = Query(default=1),
         page_size: int = Query(default=20),
     ):
@@ -1464,6 +1696,7 @@ def register_comment_center_routes(app: FastAPI, api_server):
             days=days,
             keyword=keyword.strip(),
             regions=region_list,
+            has_phone=has_phone.strip().lower(),
             page=page,
             page_size=page_size,
         )
@@ -1475,6 +1708,7 @@ def register_comment_center_routes(app: FastAPI, api_server):
         time_range: str = Query(default=""),
         keyword: str = Query(default=""),
         regions: str = Query(default=""),
+        has_phone: str = Query(default="no"),
     ):
         await ensure_storage_ready()
         days = None
@@ -1487,6 +1721,7 @@ def register_comment_center_routes(app: FastAPI, api_server):
             days=days,
             keyword=keyword.strip(),
             regions=region_list,
+            has_phone=has_phone.strip().lower(),
         )
 
         wb = Workbook()
