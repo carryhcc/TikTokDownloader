@@ -18,9 +18,10 @@ from pyperclip import paste
 from pydantic import BaseModel
 
 try:
-    from aiomysql import connect
+    from aiomysql import connect, create_pool
 except ImportError:  # pragma: no cover
     connect = None
+    create_pool = None
 
 from ..storage.mysql_config import DEFAULT_MYSQL_CONFIG
 from ..tools import Browser
@@ -65,6 +66,8 @@ class CommentCenterRepository:
     def __init__(self, parameter):
         self.parameter = parameter
         self._config = self._resolve_mysql_config(parameter)
+        self._pool = None
+        self._db_created = False
 
     @staticmethod
     def _resolve_mysql_config(parameter) -> dict[str, Any]:
@@ -105,6 +108,13 @@ class CommentCenterRepository:
                 "mysql_database": str(cfg.get("mysql_database", self._config.get("mysql_database", "douk_downloader"))),
             }
         )
+        self.close_pool()
+
+    def close_pool(self):
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
+            self._db_created = False
 
     def persist_mysql_config(self, cfg: dict[str, Any]):
         settings = getattr(self.parameter, "settings", None)
@@ -165,31 +175,37 @@ class CommentCenterRepository:
     async def connection(self):
         if connect is None:
             raise HTTPException(status_code=500, detail="未安装 aiomysql")
-        await self._create_database_if_not_exists()
-        try:
-            db = await connect(
-                host=self._config["mysql_host"],
-                port=int(self._config["mysql_port"]),
-                user=self._config["mysql_user"],
-                password=self._config["mysql_password"],
-                db=self._config["mysql_database"],
-                charset="utf8mb4",
-                autocommit=True,
-            )
-        except RuntimeError as e:
-            if "cryptography" in str(e):
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        "MySQL 认证需要 cryptography 依赖，请执行："
-                        " `uv pip install --python .venv/bin/python cryptography`"
-                    ),
-                ) from e
-            raise
-        try:
+            
+        if not self._db_created:
+            await self._create_database_if_not_exists()
+            self._db_created = True
+            
+        if self._pool is None:
+            try:
+                self._pool = await create_pool(
+                    host=self._config["mysql_host"],
+                    port=int(self._config["mysql_port"]),
+                    user=self._config["mysql_user"],
+                    password=self._config["mysql_password"],
+                    db=self._config["mysql_database"],
+                    charset="utf8mb4",
+                    autocommit=True,
+                    minsize=1,
+                    maxsize=10,
+                )
+            except RuntimeError as e:
+                if "cryptography" in str(e):
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "MySQL 认证需要 cryptography 依赖，请执行："
+                            " `uv pip install --python .venv/bin/python cryptography`"
+                        ),
+                    ) from e
+                raise
+
+        async with self._pool.acquire() as db:
             yield db
-        finally:
-            db.close()
 
     async def ensure_tables(self):
         async with self.connection() as db:
@@ -1170,6 +1186,16 @@ def register_comment_center_routes(app: FastAPI, api_server):
     @app.get("/comment-center/settings", response_class=HTMLResponse, tags=["评论中心"])
     async def comment_center_settings_page():
         return RedirectResponse(url="/comment-center?tab=settings")
+
+    @app.post("/comment-center/api/shutdown", tags=["评论中心"])
+    async def shutdown_comment_center():
+        controller.log_warning("收到退出程序请求，准备关闭 WebUI 服务")
+        asyncio.create_task(_shutdown_later())
+        return {"ok": True, "message": "程序正在退出，请关闭当前页面"}
+
+    async def _shutdown_later():
+        await asyncio.sleep(0.2)
+        api_server.shutdown_server()
 
     @app.get("/comment-center/api/types", tags=["评论中心"])
     async def list_types():

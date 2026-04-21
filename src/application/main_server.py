@@ -1,5 +1,7 @@
 from textwrap import dedent
 from typing import TYPE_CHECKING
+import asyncio
+import os
 import sys
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -37,6 +39,7 @@ from ..models import (
 )
 from ..translation import _
 from .comment_center import register_comment_center_routes
+from .web_log_streamer import patch_console, router as log_streamer_router
 from .main_terminal import TikTok
 
 if TYPE_CHECKING:
@@ -67,6 +70,7 @@ class APIServer(TikTok):
             server_mode,
         )
         self.server = None
+        self.uvicorn_server = None
 
     async def handle_redirect(self, text: str, proxy: str = None) -> str:
         return await self.links.run(
@@ -105,10 +109,19 @@ class APIServer(TikTok):
             log_config=None if getattr(sys, "stderr", None) is None else LOGGING_CONFIG,
         )
         server = Server(config)
+        self.uvicorn_server = server
         await server.serve()
+
+    def shutdown_server(self):
+        if self.uvicorn_server:
+            self.uvicorn_server.should_exit = True
+        import threading
+        threading.Timer(0.5, lambda: os._exit(0)).start()
 
     def setup_routes(self):
         register_comment_center_routes(self.server, self)
+        self.server.include_router(log_streamer_router)
+        patch_console(self.console)
 
         @self.server.get(
             "/",

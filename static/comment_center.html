@@ -23,6 +23,8 @@
     }
     .wrap { max-width: 1240px; margin: 20px auto; padding: 0 16px; }
     .title { font-size: 24px; font-weight: 700; margin: 0 0 12px; }
+    .header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .header .title { margin: 0; }
     .app-locked { overflow: hidden; }
 
     .startup-modal {
@@ -95,6 +97,7 @@
     button { cursor: pointer; }
     button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
     button.danger { background: #fff4f2; border-color: #ffd4cf; color: var(--danger); }
+    button.exit { background: #1f2937; border-color: #111827; color: #fff; }
 
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { border-bottom: 1px solid #edf1f5; text-align: left; padding: 8px 6px; vertical-align: top; }
@@ -157,7 +160,10 @@
   </div>
 
   <div class="wrap">
-    <h1 class="title">评论采集中心</h1>
+    <div class="header">
+      <h1 class="title">评论采集中心</h1>
+      <button class="exit" id="btnExitApp">退出程序</button>
+    </div>
 
     <div class="tabs" id="tabs">
       <button class="tab-btn" data-tab="urls">URL 页面</button>
@@ -165,6 +171,7 @@
       <button class="tab-btn" data-tab="task-manager">任务管理页面</button>
       <button class="tab-btn" data-tab="import">导入页面</button>
       <button class="tab-btn" data-tab="settings">设置页面</button>
+      <button class="tab-btn" data-tab="logs">运行日志</button>
     </div>
 
     <section class="panel" data-panel="urls">
@@ -340,11 +347,24 @@
         <div id="typesBox"></div>
       </div>
     </section>
+
+    <section class="panel" data-panel="logs">
+      <div class="card">
+        <div class="row" style="justify-content: space-between; margin-bottom: 0;">
+          <h3>实时运行日志</h3>
+          <div style="display:flex;gap:8px;">
+            <button id="btnClearLogs" class="link-btn">清空日志</button>
+            <button id="btnToggleAutoScroll" class="primary">自动滚动: 开</button>
+          </div>
+        </div>
+        <div id="logContainer" class="mono" style="margin-top:12px;background:#1e1e1e;color:#d4d4d4;padding:12px;border-radius:8px;font-size:13px;height:min(70vh, 800px);overflow-y:auto;white-space:pre-wrap;line-height:1.4;"></div>
+      </div>
+    </section>
   </div>
 
   <script>
     const q = (id) => document.getElementById(id);
-    const TAB_KEYS = ["urls", "comments", "task-manager", "import", "settings"];
+    const TAB_KEYS = ["urls", "comments", "task-manager", "import", "settings", "logs"];
     const REGIONS = [
       "北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江", "上海", "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南", "湖北", "湖南", "广东", "广西", "海南", "重庆", "四川", "贵州", "云南", "西藏", "陕西", "甘肃", "青海", "宁夏", "新疆", "中国香港", "中国澳门", "中国台湾"
     ];
@@ -521,6 +541,16 @@
       browserList = data.browsers || [];
       renderBrowserOptions(data.browser_default || "Chrome");
       q("tokenStatus").textContent = `Token 状态：${data.cookie_status || "未设置"}（切换后会保存到 settings.json，下次启动可继续使用）`;
+    }
+
+    async function exitApp() {
+      if (!confirm("确认退出程序？退出后本地 Web 服务会停止运行。")) return;
+      try {
+        await request("/comment-center/api/shutdown", { method: "POST" });
+        document.body.innerHTML = '<div style="padding:32px;font-family:Microsoft YaHei,sans-serif;"><h2>程序正在退出</h2><p>本地 Web 服务已收到退出请求，可以关闭当前页面。</p></div>';
+      } catch (e) {
+        alert(e.message || "退出请求失败");
+      }
     }
 
     async function switchDouyinToken() {
@@ -757,6 +787,7 @@
     }
 
     q("btnSaveDb").addEventListener("click", saveDbConfig);
+    q("btnExitApp").addEventListener("click", exitApp);
     q("btnTestDb").addEventListener("click", () => testDbConfigAndConnect(readDbConfigFromForm(), "settings"));
     q("btnStartupTestDb").addEventListener("click", testDbConfigFromStartup);
     ["startupDbHost", "startupDbPort", "startupDbUser", "startupDbPassword", "startupDbName"].forEach((id) => {
@@ -808,10 +839,41 @@
           if (!dbReady) return;
           loadTaskManager().catch(() => {});
         }, 3000);
+        
+        // Initialize Realtime Logs
+        initLogStreamer();
       } catch (e) {
         alert(e.message);
       }
     })();
+
+    let logEventSource = null;
+    let logAutoScroll = true;
+
+    function initLogStreamer() {
+      if (logEventSource) return;
+      logEventSource = new EventSource("/comment-center/api/logs/stream");
+      logEventSource.onmessage = (e) => {
+        const container = q("logContainer");
+        const msgStr = e.data;
+        if (!msgStr) return;
+        const div = document.createElement("div");
+        div.textContent = msgStr;
+        container.appendChild(div);
+        if (logAutoScroll) {
+          container.scrollTop = container.scrollHeight;
+        }
+      };
+      
+      q("btnClearLogs").addEventListener("click", () => {
+        q("logContainer").innerHTML = "";
+      });
+      q("btnToggleAutoScroll").addEventListener("click", (e) => {
+        logAutoScroll = !logAutoScroll;
+        e.target.textContent = `自动滚动: ${logAutoScroll ? '开' : '关'}`;
+        e.target.className = logAutoScroll ? 'primary' : 'link-btn';
+      });
+    }
 
     window.removeType = removeType;
     window.collectOne = collectOne;
