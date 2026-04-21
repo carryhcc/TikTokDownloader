@@ -12,7 +12,7 @@ async def main():
         downloader.check_config()
         await downloader.check_settings(False)
 
-        url = f"http://127.0.0.1:{SERVER_PORT}/comment-center/urls"
+        url = f"http://127.0.0.1:{SERVER_PORT}/comment-center"
         Timer(1.2, lambda: open_browser(url)).start()
 
         try:

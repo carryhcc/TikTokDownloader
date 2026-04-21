@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from openpyxl import Workbook
+from pyperclip import paste
 from pydantic import BaseModel
 
 try:
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover
     connect = None
 
 from ..storage.mysql_config import DEFAULT_MYSQL_CONFIG
+from ..tools import Browser
 
 
 class TypeCreateRequest(BaseModel):
@@ -41,12 +43,21 @@ class CollectAllRequest(BaseModel):
     fetch_type: str
 
 
+class StopBatchRequest(BaseModel):
+    batch_id: int
+
+
 class DbConfigRequest(BaseModel):
     mysql_host: str
     mysql_port: int = 3306
     mysql_user: str = "root"
     mysql_password: str = ""
     mysql_database: str = "douk_downloader"
+
+
+class DouyinTokenSwitchRequest(BaseModel):
+    method: str
+    browser: str = ""
 
 
 class CommentCenterRepository:
@@ -451,6 +462,77 @@ class CommentCenterRepository:
                 rows = await cursor.fetchall()
         return [int(r[0]) for r in rows]
 
+    async def list_url_task_ids_ready_for_batch(self, fetch_type: str) -> list[int]:
+        async with self.connection() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT id
+                    FROM `comment_url_tasks`
+                    WHERE fetch_type=%s
+                      AND status NOT IN ('等待中', '处理中')
+                    ORDER BY id DESC
+                    """,
+                    (fetch_type,),
+                )
+                rows = await cursor.fetchall()
+        return [int(r[0]) for r in rows]
+
+    async def batch_update_task_status(self, task_ids: list[int], status: str, error: str | None = None):
+        ids = [int(i) for i in task_ids if int(i) > 0]
+        if not ids:
+            return
+        placeholders = ", ".join(["%s"] * len(ids))
+        sql = (
+            f"UPDATE `comment_url_tasks` SET status=%s, last_error=%s, last_fetch_at=NOW() "
+            f"WHERE id IN ({placeholders})"
+        )
+        async with self.connection() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute(sql, tuple([status, error, *ids]))
+
+    async def list_task_type_stats(self) -> list[dict[str, Any]]:
+        async with self.connection() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT
+                        fetch_type,
+                        COUNT(*) AS total_count,
+                        SUM(CASE WHEN status IN ('处理完成', '处理失败', '已终止') THEN 1 ELSE 0 END) AS processed_count,
+                        SUM(CASE WHEN status='处理中' THEN 1 ELSE 0 END) AS running_count,
+                        SUM(CASE WHEN status='等待中' THEN 1 ELSE 0 END) AS waiting_count
+                    FROM `comment_url_tasks`
+                    GROUP BY fetch_type
+                    ORDER BY fetch_type ASC
+                    """
+                )
+                rows = await cursor.fetchall()
+        return [
+            {
+                "fetch_type": str(r[0] or ""),
+                "total_count": int(r[1] or 0),
+                "processed_count": int(r[2] or 0),
+                "running_count": int(r[3] or 0),
+                "waiting_count": int(r[4] or 0),
+            }
+            for r in rows
+            if str(r[0] or "")
+        ]
+
+    async def list_comment_type_counts(self) -> dict[str, int]:
+        async with self.connection() as db:
+            async with db.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT fetch_type, COUNT(*) AS comment_count
+                    FROM `comment_records`
+                    GROUP BY fetch_type
+                    """
+                )
+                rows = await cursor.fetchall()
+        return {str(r[0] or ""): int(r[1] or 0) for r in rows if str(r[0] or "")}
+
     async def upsert_comments(
         self,
         task_id: int,
@@ -709,6 +791,74 @@ class CommentCenterController:
         self.api_server = api_server
         self.repo = CommentCenterRepository(api_server.parameter)
 
+    @staticmethod
+    def _mask_cookie(cookie: dict[str, Any] | str) -> str:
+        if isinstance(cookie, dict):
+            if not cookie:
+                return "未设置"
+            has_login = "sessionid_ss" in cookie
+            return f"已设置（{len(cookie)} 项，{'已登录' if has_login else '未登录'}）"
+        if isinstance(cookie, str) and cookie.strip():
+            return "已设置（字符串）"
+        return "未设置"
+
+    def get_douyin_token_status(self) -> dict[str, Any]:
+        parameter = self.api_server.parameter
+        settings_data = {}
+        settings = getattr(parameter, "settings", None)
+        if settings and hasattr(settings, "read"):
+            loaded = settings.read()
+            if isinstance(loaded, dict):
+                settings_data = loaded
+        cookie_val = settings_data.get("cookie", {})
+        browser_default = (
+            getattr(parameter, "browser_info", {}).get("browser_name", "Chrome")
+            if hasattr(parameter, "browser_info")
+            else "Chrome"
+        )
+        return {
+            "cookie_status": self._mask_cookie(cookie_val),
+            "browser_default": browser_default,
+            "browsers": list(Browser.SUPPORT_BROWSER.keys()),
+        }
+
+    async def switch_douyin_token(self, method: str, browser_name: str = "") -> dict[str, Any]:
+        parameter = self.api_server.parameter
+        cookie_object = getattr(parameter, "cookie_object", None)
+        if cookie_object is None:
+            raise HTTPException(status_code=500, detail="Cookie 模块不可用")
+
+        mode = method.strip().lower()
+        cookie_data: dict[str, Any] = {}
+        if mode == "clipboard":
+            raw = paste()
+            if not cookie_object.validate_cookie_minimal(raw):
+                raise HTTPException(status_code=400, detail="当前剪贴板不是有效的 Cookie")
+            cookie_data = cookie_object.extract(raw, write=False, key="cookie", platform="抖音")
+        elif mode == "browser":
+            select = (browser_name or getattr(parameter, "browser_info", {}).get("browser_name", "Chrome")).strip()
+            browser = Browser(parameter, cookie_object)
+            cookie_data = browser.get(select, Browser.PLATFORM[False].domain)
+            if not cookie_data:
+                raise HTTPException(status_code=400, detail=f"浏览器读取失败: {select}")
+        else:
+            raise HTTPException(status_code=400, detail="method 仅支持 clipboard 或 browser")
+
+        cookie_object.save_cookie(cookie_data, "cookie")
+        parameter.set_cookie(cookie_data, "")
+        parameter.set_headers_cookie()
+        try:
+            await parameter.update_params()
+        except Exception:
+            # Cookie 已持久化，不阻断请求；下次轮询会继续刷新参数
+            pass
+
+        return {
+            "ok": True,
+            "message": "抖音 Token 已切换并保存，下次启动仍可使用",
+            "cookie_status": self._mask_cookie(cookie_data),
+        }
+
     async def resolve_detail_id(self, task: dict[str, Any]) -> str:
         if task.get("detail_id"):
             return task["detail_id"]
@@ -771,6 +921,9 @@ class CommentCenterController:
         except HTTPException:
             await self.repo.update_task_status(task_id, "处理失败", "采集失败")
             raise
+        except asyncio.CancelledError:
+            await self.repo.update_task_status(task_id, "已终止", "任务被手动终止")
+            raise
         except Exception as e:
             await self.repo.update_task_status(task_id, "处理失败", str(e))
             raise HTTPException(status_code=500, detail=f"采集失败: {e}") from e
@@ -779,23 +932,115 @@ class CommentCenterController:
 class CommentTaskDispatcher:
     def __init__(self, controller: CommentCenterController):
         self.controller = controller
-        self.queue: asyncio.Queue[int] = asyncio.Queue()
+        self.queue: asyncio.Queue[tuple[int, int | None]] = asyncio.Queue()
         self.queued_ids: set[int] = set()
         self.worker_task: asyncio.Task | None = None
+        self.current_item: tuple[int, int | None] | None = None
         self.lock = asyncio.Lock()
+        self.batch_seq = 0
+        self.active_batch: dict[str, Any] | None = None
 
     async def ensure_worker(self):
         if self.worker_task is None or self.worker_task.done():
             self.worker_task = asyncio.create_task(self._worker_loop())
 
-    async def enqueue(self, task_id: int) -> bool:
+    async def enqueue(self, task_id: int, batch_id: int | None = None) -> bool:
         await self.ensure_worker()
         async with self.lock:
             if task_id in self.queued_ids:
                 return False
             self.queued_ids.add(task_id)
-            await self.queue.put(task_id)
+            await self.queue.put((task_id, batch_id))
             return True
+
+    async def create_batch(self, fetch_type: str, total: int) -> tuple[dict[str, Any] | None, str]:
+        async with self.lock:
+            if self.active_batch and self.active_batch.get("status") in {"running", "stopping"}:
+                return None, "已有任务进行中"
+            self.batch_seq += 1
+            self.active_batch = {
+                "batch_id": self.batch_seq,
+                "fetch_type": fetch_type,
+                "status": "running",
+                "total_count": int(total),
+                "processed_count": 0,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            return dict(self.active_batch), ""
+
+    async def get_active_batch(self) -> dict[str, Any] | None:
+        async with self.lock:
+            if not self.active_batch:
+                return None
+            return dict(self.active_batch)
+
+    async def stop_active_batch(self, batch_id: int) -> tuple[bool, str]:
+        running_task_id: int | None = None
+        pending_task_ids: list[int] = []
+        async with self.lock:
+            if not self.active_batch:
+                return False, "当前没有批量任务在执行"
+            if int(self.active_batch.get("batch_id", 0)) != int(batch_id):
+                return False, "批量任务已变更，请刷新后重试"
+
+            self.active_batch["status"] = "stopping"
+            self.active_batch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            drained: list[tuple[int, int | None]] = []
+            while not self.queue.empty():
+                try:
+                    item = self.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self.queue.task_done()
+                task_id, item_batch_id = item
+                if item_batch_id == batch_id:
+                    pending_task_ids.append(task_id)
+                    self.queued_ids.discard(task_id)
+                else:
+                    drained.append(item)
+            for item in drained:
+                await self.queue.put(item)
+
+            if self.current_item and self.current_item[1] == batch_id:
+                running_task_id = self.current_item[0]
+
+        if pending_task_ids:
+            await self.controller.repo.batch_update_task_status(pending_task_ids, "已终止", "批量任务被手动终止")
+
+        if self.worker_task and not self.worker_task.done():
+            self.worker_task.cancel()
+            try:
+                await self.worker_task
+            except asyncio.CancelledError:
+                pass
+
+        async with self.lock:
+            if self.active_batch and int(self.active_batch.get("batch_id", 0)) == int(batch_id):
+                processed = int(self.active_batch.get("processed_count") or 0)
+                processed += len(pending_task_ids)
+                self.active_batch["processed_count"] = min(processed, int(self.active_batch.get("total_count") or 0))
+                self.active_batch["status"] = "stopped"
+                self.active_batch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.active_batch = None
+
+        await self.ensure_worker()
+        if running_task_id:
+            return True, "已终止当前批量任务（含正在执行任务）"
+        return True, "已终止当前批量任务"
+
+    async def mark_batch_task_done(self, batch_id: int | None):
+        if batch_id is None:
+            return
+        async with self.lock:
+            if not self.active_batch or int(self.active_batch.get("batch_id", 0)) != int(batch_id):
+                return
+            self.active_batch["processed_count"] = int(self.active_batch.get("processed_count") or 0) + 1
+            self.active_batch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if int(self.active_batch["processed_count"]) >= int(self.active_batch.get("total_count") or 0):
+                self.active_batch["status"] = "done"
+                self.active_batch = None
 
     async def close(self):
         if self.worker_task and not self.worker_task.done():
@@ -807,7 +1052,8 @@ class CommentTaskDispatcher:
 
     async def _worker_loop(self):
         while True:
-            task_id = await self.queue.get()
+            task_id, batch_id = await self.queue.get()
+            self.current_item = (task_id, batch_id)
             try:
                 await self.controller.process_task(task_id)
             except Exception:
@@ -816,7 +1062,9 @@ class CommentTaskDispatcher:
             finally:
                 async with self.lock:
                     self.queued_ids.discard(task_id)
+                    self.current_item = None
                 self.queue.task_done()
+                await self.mark_batch_task_done(batch_id)
 
 
 def _split_urls(req: UrlCreateRequest) -> list[str]:
@@ -862,21 +1110,26 @@ def register_comment_center_routes(app: FastAPI, api_server):
 
     @app.get("/comment-center", tags=["评论中心"])
     async def comment_center_home():
-        return RedirectResponse(url="/comment-center/urls")
+        page = Path(__file__).resolve().parents[2] / "static" / "comment_center.html"
+        if not page.exists():
+            return HTMLResponse("<h1>comment_center.html not found</h1>", status_code=500)
+        return HTMLResponse(page.read_text(encoding="utf-8"))
 
     @app.get("/comment-center/urls", response_class=HTMLResponse, tags=["评论中心"])
     async def comment_center_urls_page():
-        page = Path(__file__).resolve().parents[2] / "static" / "comment_center_urls.html"
-        if not page.exists():
-            return HTMLResponse("<h1>comment_center_urls.html not found</h1>", status_code=500)
-        return HTMLResponse(page.read_text(encoding="utf-8"))
+        return RedirectResponse(url="/comment-center?tab=urls")
 
     @app.get("/comment-center/comments", response_class=HTMLResponse, tags=["评论中心"])
     async def comment_center_comments_page():
-        page = Path(__file__).resolve().parents[2] / "static" / "comment_center_comments.html"
-        if not page.exists():
-            return HTMLResponse("<h1>comment_center_comments.html not found</h1>", status_code=500)
-        return HTMLResponse(page.read_text(encoding="utf-8"))
+        return RedirectResponse(url="/comment-center?tab=comments")
+
+    @app.get("/comment-center/import", response_class=HTMLResponse, tags=["评论中心"])
+    async def comment_center_import_page():
+        return RedirectResponse(url="/comment-center?tab=import")
+
+    @app.get("/comment-center/settings", response_class=HTMLResponse, tags=["评论中心"])
+    async def comment_center_settings_page():
+        return RedirectResponse(url="/comment-center?tab=settings")
 
     @app.get("/comment-center/api/types", tags=["评论中心"])
     async def list_types():
@@ -895,6 +1148,17 @@ def register_comment_center_routes(app: FastAPI, api_server):
     @app.get("/comment-center/api/db-config", tags=["评论中心"])
     async def get_db_config():
         return controller.repo.get_mysql_config()
+
+    @app.get("/comment-center/api/douyin-token/status", tags=["评论中心"])
+    async def get_douyin_token_status():
+        return controller.get_douyin_token_status()
+
+    @app.post("/comment-center/api/douyin-token/switch", tags=["评论中心"])
+    async def switch_douyin_token(item: DouyinTokenSwitchRequest):
+        return await controller.switch_douyin_token(
+            method=item.method,
+            browser_name=item.browser,
+        )
 
     @app.post("/comment-center/api/db-config", tags=["评论中心"])
     async def set_db_config(item: DbConfigRequest):
@@ -980,22 +1244,70 @@ def register_comment_center_routes(app: FastAPI, api_server):
         fetch_type = req.fetch_type.strip()
         if not fetch_type:
             raise HTTPException(status_code=400, detail="获取类型不能为空")
-        task_ids = await controller.repo.list_url_task_ids_by_type(fetch_type)
+        active_batch = await dispatcher.get_active_batch()
+        if active_batch:
+            return {
+                "ok": False,
+                "conflict": True,
+                "active_batch": active_batch,
+                "message": "已有批量任务进行中",
+            }
+
+        task_ids = await controller.repo.list_url_task_ids_ready_for_batch(fetch_type)
+        if not task_ids:
+            return {"ok": False, "queued": 0, "skipped": 0, "message": "当前类型没有可执行的任务"}
+
+        batch, err = await dispatcher.create_batch(fetch_type, len(task_ids))
+        if not batch:
+            return {"ok": False, "conflict": True, "message": err or "已有批量任务进行中"}
+
+        await controller.repo.batch_update_task_status(task_ids, "等待中", None)
         queued = 0
-        skipped = 0
         for task_id in task_ids:
-            task = await controller.repo.get_task(task_id)
-            if not task:
-                continue
-            if task["status"] in {"等待中", "处理中"}:
-                skipped += 1
-                continue
-            await controller.repo.update_task_status(task_id, "等待中", None)
-            if await dispatcher.enqueue(task_id):
+            if await dispatcher.enqueue(task_id, batch_id=int(batch["batch_id"])):
                 queued += 1
-            else:
-                skipped += 1
-        return {"ok": True, "queued": queued, "skipped": skipped, "message": "任务后台处理中"}
+        skipped = max(0, len(task_ids) - queued)
+        return {
+            "ok": True,
+            "queued": queued,
+            "skipped": skipped,
+            "batch": batch,
+            "message": "批量任务已启动",
+        }
+
+    @app.post("/comment-center/api/collect-all/stop", tags=["评论中心"])
+    async def stop_collect_all(req: StopBatchRequest):
+        await ensure_storage_ready()
+        ok, message = await dispatcher.stop_active_batch(req.batch_id)
+        return {"ok": ok, "message": message}
+
+    @app.get("/comment-center/api/task-manager", tags=["评论中心"])
+    async def task_manager():
+        await ensure_storage_ready()
+        type_stats = await controller.repo.list_task_type_stats()
+        comment_counts = await controller.repo.list_comment_type_counts()
+        active_batch = await dispatcher.get_active_batch()
+
+        rows = []
+        for item in type_stats:
+            fetch_type = item["fetch_type"]
+            running_count = int(item["running_count"])
+            waiting_count = int(item["waiting_count"])
+            status = "空闲"
+            if active_batch and active_batch.get("fetch_type") == fetch_type:
+                status = "进行中"
+            elif running_count > 0 or waiting_count > 0:
+                status = "进行中"
+            rows.append(
+                {
+                    "fetch_type": fetch_type,
+                    "total_count": int(item["total_count"]),
+                    "processed_count": int(item["processed_count"]),
+                    "comment_count": int(comment_counts.get(fetch_type, 0)),
+                    "status": status,
+                }
+            )
+        return {"items": rows, "active_batch": active_batch}
 
     @app.get("/comment-center/api/comments", tags=["评论中心"])
     async def list_comments(

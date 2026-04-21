@@ -117,7 +117,7 @@ class APIServer(TikTok):
             tags=[_("项目")],
         )
         async def index():
-            return RedirectResponse(url="/comment-center/urls")
+            return RedirectResponse(url="/comment-center")
 
         @self.server.get(
             "/token",

@@ -29,7 +29,9 @@
     .scroll { max-height:62vh; overflow:auto; }
     .pager { display:flex; gap:8px; align-items:center; justify-content:flex-end; margin-top:10px; }
     .db-grid { display:grid; grid-template-columns:2fr 1fr 1fr 1fr 2fr; gap:8px; }
+    .token-grid { display:grid; grid-template-columns:1fr 1fr auto; gap:8px; align-items:center; }
     @media (max-width: 1000px) { .db-grid { grid-template-columns:1fr 1fr; } }
+    @media (max-width: 1000px) { .token-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
@@ -52,6 +54,21 @@
         <button id="btnSaveDb">保存配置</button>
         <button class="primary" id="btnTestDb">测试并连接</button>
         <span class="muted" id="dbStatus">未连接数据库</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>抖音 Token 切换</h3>
+      <div class="token-grid">
+        <select id="tokenMethod">
+          <option value="clipboard">从剪贴板读取 Cookie (抖音)</option>
+          <option value="browser">从浏览器读取 Cookie (抖音)</option>
+        </select>
+        <select id="tokenBrowser"></select>
+        <button class="primary" id="btnSwitchToken">执行切换</button>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <span class="muted" id="tokenStatus">Token 状态：未读取</span>
       </div>
     </section>
 
@@ -127,6 +144,7 @@
     let currentPage = 1;
     const pageSize = 20;
     let dbReady = false;
+    let browserList = [];
 
     async function request(url, options = {}) {
       const resp = await fetch(url, { headers: { "Content-Type": "application/json" }, ...options });
@@ -157,6 +175,38 @@
     async function loadDbConfig() {
       const cfg = await request('/comment-center/api/db-config');
       fillDbConfigForm(cfg);
+    }
+
+    function toggleBrowserSelect() {
+      const method = q('tokenMethod').value;
+      q('tokenBrowser').disabled = method !== 'browser';
+    }
+
+    function renderBrowserOptions(defaultBrowser = '') {
+      const target = q('tokenBrowser');
+      const items = browserList.length ? browserList : ['Chrome'];
+      target.innerHTML = items.map(b => `<option value="${esc(b)}">${esc(b)}</option>`).join('');
+      const pick = defaultBrowser && items.includes(defaultBrowser) ? defaultBrowser : items[0];
+      target.value = pick;
+      toggleBrowserSelect();
+    }
+
+    async function loadTokenStatus() {
+      const data = await request('/comment-center/api/douyin-token/status');
+      browserList = data.browsers || [];
+      renderBrowserOptions(data.browser_default || 'Chrome');
+      q('tokenStatus').textContent = `Token 状态：${data.cookie_status || '未设置'}（切换后会保存到 settings.json，下次启动可继续使用）`;
+    }
+
+    async function switchDouyinToken() {
+      const method = q('tokenMethod').value;
+      const browser = q('tokenBrowser').value;
+      const res = await request('/comment-center/api/douyin-token/switch', {
+        method: 'POST',
+        body: JSON.stringify({ method, browser }),
+      });
+      q('tokenStatus').textContent = `Token 状态：${res.cookie_status || '已更新'}（已持久化）`;
+      alert(res.message || '切换完成');
     }
 
     async function saveDbConfig() {
@@ -296,6 +346,8 @@
 
     q('btnSaveDb').addEventListener('click', saveDbConfig);
     q('btnTestDb').addEventListener('click', testDbConfigAndConnect);
+    q('tokenMethod').addEventListener('change', toggleBrowserSelect);
+    q('btnSwitchToken').addEventListener('click', switchDouyinToken);
     q('btnAddType').addEventListener('click', addType);
     q('btnAddUrl').addEventListener('click', addUrls);
     q('btnFilterUrl').addEventListener('click', () => loadUrls(1));
@@ -306,6 +358,7 @@
     (async () => {
       try {
         await loadDbConfig();
+        await loadTokenStatus();
       } catch (e) {
         alert(e.message);
       }
