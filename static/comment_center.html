@@ -627,7 +627,7 @@
       });
       q("newUrls").value = "";
       await Promise.all([loadUrls(1), loadTaskManager()]);
-      alert(`新增完成，新增 ${res.inserted} 条，重复 ${res.duplicated} 条`);
+      alert(`新增完成，新增 ${res.inserted} 条，重复 ${res.duplicated} 条，忽略无效链接 ${res.ignored || 0} 条`);
     }
 
     async function loadUrls(page = currentUrlPage) {

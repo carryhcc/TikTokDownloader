@@ -19,9 +19,9 @@ jobs:
             python_arch: x64
           # ARM64 需要 ARM64 Windows Runner。
           # 如果你没有 ARM64 自托管 Runner，请把 runner 改成你实际可用标签。
-          - arch: arm64
-            runner: windows-11-arm
-            python_arch: arm64
+#          - arch: arm64
+#            runner: windows-11-arm
+#            python_arch: arm64
 
     runs-on: ${{ matrix.runner }}
 

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
+from random import shuffle
 from re import search
 from urllib.parse import parse_qs, urlparse
 from typing import Any
@@ -462,22 +463,6 @@ class CommentCenterRepository:
                 rows = await cursor.fetchall()
         return [int(r[0]) for r in rows]
 
-    async def list_url_task_ids_ready_for_batch(self, fetch_type: str) -> list[int]:
-        async with self.connection() as db:
-            async with db.cursor() as cursor:
-                await cursor.execute(
-                    """
-                    SELECT id
-                    FROM `comment_url_tasks`
-                    WHERE fetch_type=%s
-                      AND status NOT IN ('等待中', '处理中')
-                    ORDER BY id DESC
-                    """,
-                    (fetch_type,),
-                )
-                rows = await cursor.fetchall()
-        return [int(r[0]) for r in rows]
-
     async def batch_update_task_status(self, task_ids: list[int], status: str, error: str | None = None):
         ids = [int(i) for i in task_ids if int(i) > 0]
         if not ids:
@@ -499,7 +484,7 @@ class CommentCenterRepository:
                     SELECT
                         fetch_type,
                         COUNT(*) AS total_count,
-                        SUM(CASE WHEN status IN ('处理完成', '处理失败', '已终止') THEN 1 ELSE 0 END) AS processed_count,
+                        SUM(CASE WHEN status IN ('处理完成', '处理失败') THEN 1 ELSE 0 END) AS processed_count,
                         SUM(CASE WHEN status='处理中' THEN 1 ELSE 0 END) AS running_count,
                         SUM(CASE WHEN status='等待中' THEN 1 ELSE 0 END) AS waiting_count
                     FROM `comment_url_tasks`
@@ -790,6 +775,16 @@ class CommentCenterController:
     def __init__(self, api_server):
         self.api_server = api_server
         self.repo = CommentCenterRepository(api_server.parameter)
+        self.logger = api_server.parameter.logger
+
+    def log_info(self, message: str):
+        self.logger.info(f"[评论中心] {message}")
+
+    def log_warning(self, message: str):
+        self.logger.warning(f"[评论中心] {message}")
+
+    def log_error(self, message: str):
+        self.logger.error(f"[评论中心] {message}")
 
     @staticmethod
     def _mask_cookie(cookie: dict[str, Any] | str) -> str:
@@ -896,7 +891,11 @@ class CommentCenterController:
             raise HTTPException(status_code=404, detail="URL任务不存在")
 
         try:
+            self.log_info(
+                f"开始处理 URL 任务 #{task_id}，类型：{task['fetch_type']}，URL：{task['url']}"
+            )
             detail_id = await self.resolve_detail_id(task)
+            self.log_info(f"任务 #{task_id} 已解析作品 ID：{detail_id}")
             await self.repo.update_task_status(task_id, "处理中", None)
             data = await self.api_server.comment_handle_single(
                 detail_id,
@@ -912,20 +911,26 @@ class CommentCenterController:
                 data,
             )
             await self.repo.update_task_status(task_id, "处理完成", None)
+            self.log_info(
+                f"任务 #{task_id} 处理完成，作品 ID：{detail_id}，获取评论 {len(data)} 条"
+            )
             return {
                 "task_id": task_id,
                 "detail_id": detail_id,
                 "fetch_type": task["fetch_type"],
                 "count": len(data),
             }
-        except HTTPException:
+        except HTTPException as e:
             await self.repo.update_task_status(task_id, "处理失败", "采集失败")
+            self.log_warning(f"任务 #{task_id} 处理失败：{e.detail}")
             raise
         except asyncio.CancelledError:
-            await self.repo.update_task_status(task_id, "已终止", "任务被手动终止")
+            await self.repo.update_task_status(task_id, "未处理", "任务被手动终止，已回到未处理")
+            self.log_warning(f"任务 #{task_id} 已被手动终止，并回到未处理状态")
             raise
         except Exception as e:
             await self.repo.update_task_status(task_id, "处理失败", str(e))
+            self.log_error(f"任务 #{task_id} 处理异常：{e}")
             raise HTTPException(status_code=500, detail=f"采集失败: {e}") from e
 
 
@@ -967,6 +972,9 @@ class CommentTaskDispatcher:
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
+            self.controller.log_info(
+                f"批量任务 #{self.batch_seq} 已创建，类型：{fetch_type}，总任务数：{total}"
+            )
             return dict(self.active_batch), ""
 
     async def get_active_batch(self) -> dict[str, Any] | None:
@@ -1006,8 +1014,16 @@ class CommentTaskDispatcher:
             if self.current_item and self.current_item[1] == batch_id:
                 running_task_id = self.current_item[0]
 
+        self.controller.log_warning(
+            f"正在终止批量任务 #{batch_id}，队列中待终止任务数：{len(pending_task_ids)}"
+        )
+
         if pending_task_ids:
-            await self.controller.repo.batch_update_task_status(pending_task_ids, "已终止", "批量任务被手动终止")
+            await self.controller.repo.batch_update_task_status(
+                pending_task_ids,
+                "未处理",
+                "批量任务被手动终止，已回到未处理",
+            )
 
         if self.worker_task and not self.worker_task.done():
             self.worker_task.cancel()
@@ -1026,6 +1042,7 @@ class CommentTaskDispatcher:
                 self.active_batch = None
 
         await self.ensure_worker()
+        self.controller.log_warning(f"批量任务 #{batch_id} 已终止")
         if running_task_id:
             return True, "已终止当前批量任务（含正在执行任务）"
         return True, "已终止当前批量任务"
@@ -1038,8 +1055,15 @@ class CommentTaskDispatcher:
                 return
             self.active_batch["processed_count"] = int(self.active_batch.get("processed_count") or 0) + 1
             self.active_batch["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            processed = int(self.active_batch["processed_count"])
+            total = int(self.active_batch.get("total_count") or 0)
+            fetch_type = self.active_batch.get("fetch_type", "")
+            self.controller.log_info(
+                f"批量任务 #{batch_id} 进度：{processed}/{total}，类型：{fetch_type}"
+            )
             if int(self.active_batch["processed_count"]) >= int(self.active_batch.get("total_count") or 0):
                 self.active_batch["status"] = "done"
+                self.controller.log_info(f"批量任务 #{batch_id} 已完成，类型：{fetch_type}")
                 self.active_batch = None
 
     async def close(self):
@@ -1054,6 +1078,9 @@ class CommentTaskDispatcher:
         while True:
             task_id, batch_id = await self.queue.get()
             self.current_item = (task_id, batch_id)
+            self.controller.log_info(
+                f"后台队列取出任务 #{task_id}" + (f"，批量任务 #{batch_id}" if batch_id else "")
+            )
             try:
                 await self.controller.process_task(task_id)
             except Exception:
@@ -1067,7 +1094,15 @@ class CommentTaskDispatcher:
                 await self.mark_batch_task_done(batch_id)
 
 
-def _split_urls(req: UrlCreateRequest) -> list[str]:
+def _is_valid_http_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _split_urls(req: UrlCreateRequest) -> tuple[list[str], list[str]]:
     urls: list[str] = []
     if req.url.strip():
         urls.append(req.url.strip())
@@ -1079,11 +1114,16 @@ def _split_urls(req: UrlCreateRequest) -> list[str]:
     # 保序去重
     seen = set()
     result = []
+    invalid = []
     for u in urls:
-        if u not in seen:
-            seen.add(u)
+        if u in seen:
+            continue
+        seen.add(u)
+        if _is_valid_http_url(u):
             result.append(u)
-    return result
+        else:
+            invalid.append(u)
+    return result, invalid
 
 
 def register_comment_center_routes(app: FastAPI, api_server):
@@ -1210,9 +1250,9 @@ def register_comment_center_routes(app: FastAPI, api_server):
         if not await controller.repo.type_exists(fetch_type):
             raise HTTPException(status_code=400, detail="类型不存在，请先新增类型")
 
-        urls = _split_urls(item)
+        urls, invalid_urls = _split_urls(item)
         if not urls:
-            raise HTTPException(status_code=400, detail="URL 不能为空")
+            raise HTTPException(status_code=400, detail="没有有效链接，请输入 http/https URL")
 
         inserted = 0
         duplicated = 0
@@ -1224,7 +1264,13 @@ def register_comment_center_routes(app: FastAPI, api_server):
                 inserted += 1
             else:
                 duplicated += 1
-        return {"inserted": inserted, "duplicated": duplicated, "ids": ids}
+        return {
+            "inserted": inserted,
+            "duplicated": duplicated,
+            "ignored": len(invalid_urls),
+            "invalid_urls": invalid_urls[:10],
+            "ids": ids,
+        }
 
     @app.post("/comment-center/api/collect-one", tags=["评论中心"])
     async def collect_one(req: CollectOneRequest):
@@ -1233,9 +1279,11 @@ def register_comment_center_routes(app: FastAPI, api_server):
         if not task:
             raise HTTPException(status_code=404, detail="URL任务不存在")
         if task["status"] in {"等待中", "处理中"}:
+            controller.log_info(f"单条任务 #{req.task_id} 已在队列中或处理中，跳过重复入队")
             return {"ok": True, "message": "任务已在队列中或处理中"}
         await controller.repo.update_task_status(req.task_id, "等待中", None)
         queued = await dispatcher.enqueue(req.task_id)
+        controller.log_info(f"单条任务 #{req.task_id} 已提交后台队列，queued={queued}")
         return {"ok": True, "queued": queued, "message": "任务后台处理中"}
 
     @app.post("/comment-center/api/collect-all", tags=["评论中心"])
@@ -1246,6 +1294,9 @@ def register_comment_center_routes(app: FastAPI, api_server):
             raise HTTPException(status_code=400, detail="获取类型不能为空")
         active_batch = await dispatcher.get_active_batch()
         if active_batch:
+            controller.log_warning(
+                f"收到新的批量请求（类型：{fetch_type}），但批量任务 #{active_batch.get('batch_id')} 正在进行"
+            )
             return {
                 "ok": False,
                 "conflict": True,
@@ -1253,10 +1304,12 @@ def register_comment_center_routes(app: FastAPI, api_server):
                 "message": "已有批量任务进行中",
             }
 
-        task_ids = await controller.repo.list_url_task_ids_ready_for_batch(fetch_type)
+        task_ids = await controller.repo.list_url_task_ids_by_type(fetch_type)
         if not task_ids:
-            return {"ok": False, "queued": 0, "skipped": 0, "message": "当前类型没有可执行的任务"}
+            controller.log_warning(f"批量任务未启动，类型 {fetch_type} 没有 URL 任务")
+            return {"ok": False, "queued": 0, "skipped": 0, "message": "当前类型没有 URL 任务"}
 
+        shuffle(task_ids)
         batch, err = await dispatcher.create_batch(fetch_type, len(task_ids))
         if not batch:
             return {"ok": False, "conflict": True, "message": err or "已有批量任务进行中"}
@@ -1267,6 +1320,9 @@ def register_comment_center_routes(app: FastAPI, api_server):
             if await dispatcher.enqueue(task_id, batch_id=int(batch["batch_id"])):
                 queued += 1
         skipped = max(0, len(task_ids) - queued)
+        controller.log_info(
+            f"批量任务 #{batch['batch_id']} 已提交队列，类型：{fetch_type}，入队：{queued}，跳过：{skipped}，顺序：随机"
+        )
         return {
             "ok": True,
             "queued": queued,
@@ -1278,6 +1334,7 @@ def register_comment_center_routes(app: FastAPI, api_server):
     @app.post("/comment-center/api/collect-all/stop", tags=["评论中心"])
     async def stop_collect_all(req: StopBatchRequest):
         await ensure_storage_ready()
+        controller.log_warning(f"收到停止批量任务请求，batch_id={req.batch_id}")
         ok, message = await dispatcher.stop_active_batch(req.batch_id)
         return {"ok": ok, "message": message}
 
