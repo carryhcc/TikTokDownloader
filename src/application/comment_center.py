@@ -116,6 +116,59 @@ class CommentCenterRepository:
             self._pool = None
             self._db_created = False
 
+    @staticmethod
+    def _is_connection_lost_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in (
+                "incompletereaderror",
+                "server has gone away",
+                "lost connection",
+                "connection reset",
+                "broken pipe",
+                "connection closed",
+            )
+        )
+
+    async def _reset_pool(self):
+        pool = self._pool
+        self._pool = None
+        if pool is None:
+            return
+        pool.close()
+        try:
+            await pool.wait_closed()
+        except Exception:
+            pass
+
+    async def _ensure_pool(self):
+        if self._pool is not None:
+            return
+        try:
+            self._pool = await create_pool(
+                host=self._config["mysql_host"],
+                port=int(self._config["mysql_port"]),
+                user=self._config["mysql_user"],
+                password=self._config["mysql_password"],
+                db=self._config["mysql_database"],
+                charset="utf8mb4",
+                autocommit=True,
+                minsize=1,
+                maxsize=10,
+                pool_recycle=1800,
+            )
+        except RuntimeError as e:
+            if "cryptography" in str(e):
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "MySQL 认证需要 cryptography 依赖，请执行："
+                        " `uv pip install --python .venv/bin/python cryptography`"
+                    ),
+                ) from e
+            raise
+
     def persist_mysql_config(self, cfg: dict[str, Any]):
         settings = getattr(self.parameter, "settings", None)
         if not settings or not hasattr(settings, "read") or not hasattr(settings, "update"):
@@ -180,32 +233,22 @@ class CommentCenterRepository:
             await self._create_database_if_not_exists()
             self._db_created = True
             
-        if self._pool is None:
-            try:
-                self._pool = await create_pool(
-                    host=self._config["mysql_host"],
-                    port=int(self._config["mysql_port"]),
-                    user=self._config["mysql_user"],
-                    password=self._config["mysql_password"],
-                    db=self._config["mysql_database"],
-                    charset="utf8mb4",
-                    autocommit=True,
-                    minsize=1,
-                    maxsize=10,
-                )
-            except RuntimeError as e:
-                if "cryptography" in str(e):
-                    raise HTTPException(
-                        status_code=500,
-                        detail=(
-                            "MySQL 认证需要 cryptography 依赖，请执行："
-                            " `uv pip install --python .venv/bin/python cryptography`"
-                        ),
-                    ) from e
-                raise
+        await self._ensure_pool()
 
-        async with self._pool.acquire() as db:
-            yield db
+        for attempt in range(2):
+            async with self._pool.acquire() as db:
+                try:
+                    await db.ping(reconnect=True)
+                except Exception as e:
+                    if attempt == 0 and self._is_connection_lost_error(e):
+                        await self._reset_pool()
+                        await self._ensure_pool()
+                        continue
+                    raise
+                yield db
+                return
+
+        raise HTTPException(status_code=500, detail="数据库连接异常，请稍后重试")
 
     async def ensure_tables(self):
         async with self.connection() as db:
@@ -291,6 +334,14 @@ class CommentCenterRepository:
                         ELSE `status`
                     END
                     WHERE `status` IN ('pending', 'ready', 'running', 'done', 'failed');
+                    """
+                )
+                # 修复异常退出死锁问题：将卡在 进行中/等待中 的僵尸任务重置为未处理
+                await cursor.execute(
+                    """
+                    UPDATE `comment_url_tasks`
+                    SET `status` = '未处理'
+                    WHERE `status` IN ('处理中', '等待中');
                     """
                 )
                 await cursor.execute(

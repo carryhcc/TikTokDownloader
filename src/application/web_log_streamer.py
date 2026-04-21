@@ -83,12 +83,21 @@ async def attach_loggers():
             # Attempt to avoid double formatting if Uvicorn already formats it
             return super().format(record)
 
+    class SupressTaskManagerFilter(logging.Filter):
+        def filter(self, record):
+            msg = record.getMessage()
+            if "GET /comment-center/api/task-manager" in msg:
+                return False
+            return True
+
     web_handler.setFormatter(StripAnsiFormatter('%(levelname)s:     %(message)s'))
     
     # Uvicorn loggers
     for logger_name in ("uvicorn.access", "uvicorn.error", "fastapi"):
         l = logging.getLogger(logger_name)
         l.addHandler(web_handler)
+        if logger_name == "uvicorn.access":
+            l.addFilter(SupressTaskManagerFilter())
     
     # Root logger fallback
     logging.getLogger().addHandler(web_handler)
