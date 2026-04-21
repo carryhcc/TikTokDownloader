@@ -5,6 +5,8 @@ on:
 
 jobs:
   build:
+    # 在 dev 分支禁用旧版 main.py 打包流程，避免和 WebUI 打包混淆
+    if: ${{ github.ref_name != 'dev' }}
     name: 构建于 ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -30,26 +32,17 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           echo "DATE=$(Get-Date -Format 'yyyyMMdd')" >> $env:GITHUB_ENV
-          if ("${{ github.ref_name }}" -eq "dev") {
-            pyinstaller --noconfirm --clean --noconsole --onedir --name DouKWebUI --icon=./static/images/DouK-Downloader.ico --add-data "static;static" --add-data "locale;locale" --add-data "docs;docs" main_webui.py
-          }
-          else {
-            pyinstaller --icon=./static/images/DouK-Downloader.ico --add-data "static:static" --add-data "locale:locale" --collect-all rich main.py
-          }
+          pyinstaller --icon=./static/images/DouK-Downloader.ico --add-data "static:static" --add-data "locale:locale" --collect-all rich main.py
         shell: pwsh
 
       - name: 构建 Mac 可执行文件
         if: runner.os == 'macOS'
         run: |
           echo "DATE=$(date +'%Y%m%d')" >> $GITHUB_ENV
-          if [ "${{ github.ref_name }}" = "dev" ]; then
-            pyinstaller --noconfirm --clean --noconsole --onedir --name DouKWebUI --icon=./static/images/DouK-Downloader.icns --add-data "static:static" --add-data "locale:locale" --add-data "docs:docs" main_webui.py
-          else
-            pyinstaller --icon=./static/images/DouK-Downloader.icns --add-data "static:static" --add-data "locale:locale" --collect-all rich main.py
-          fi
+          pyinstaller --icon=./static/images/DouK-Downloader.icns --add-data "static:static" --add-data "locale:locale" --collect-all rich main.py
 
       - name: 上传文件
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.ref_name == 'dev' && format('DouKWebUI_{0}_{1}_{2}', runner.os, runner.arch, env.DATE) || format('DouK-Downloader_{0}_{1}_{2}', runner.os, runner.arch, env.DATE) }}
-          path: ${{ github.ref_name == 'dev' && 'dist/DouKWebUI/' || 'dist/main/' }}
+          name: DouK-Downloader_${{ runner.os }}_${{ runner.arch }}_${{ env.DATE }}
+          path: dist/main/
